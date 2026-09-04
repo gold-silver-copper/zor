@@ -89,6 +89,14 @@ struct BoundaryTracker {
     state: Sequence,
 }
 
+struct ParserStep {
+    byte: Option<u8>,
+    entered_string: bool,
+    exited_string: bool,
+    cancelled_string: bool,
+    injected_reset: bool,
+}
+
 impl BoundaryTracker {
     #[cfg(test)]
     fn feed(&mut self, bytes: &[u8]) {
@@ -162,7 +170,8 @@ impl BoundaryTracker {
     /// Returns the byte the VT parser may consume. The first over-limit byte is replaced by CAN,
     /// resetting the parser without retaining the accumulated string; subsequent bytes through
     /// the real terminator are observed only by this constant-space boundary state machine.
-    fn parser_byte(&mut self, byte: u8) -> (Option<u8>, bool) {
+    fn parser_byte(&mut self, byte: u8) -> ParserStep {
+        let was_string = matches!(self.state, Sequence::String { .. });
         let was_discarding = matches!(
             self.state,
             Sequence::String {
@@ -171,19 +180,30 @@ impl BoundaryTracker {
             }
         );
         self.byte(byte);
+        let is_string = matches!(self.state, Sequence::String { .. });
+        let exited_string = was_string && !is_string;
         if was_discarding {
-            return (None, false);
+            return ParserStep {
+                byte: None,
+                entered_string: false,
+                exited_string,
+                cancelled_string: exited_string && matches!(byte, 0x18 | 0x1a),
+                injected_reset: false,
+            };
         }
-        if matches!(
+        let injected_reset = matches!(
             self.state,
             Sequence::String {
                 discarded: true,
                 ..
             }
-        ) {
-            (Some(0x18), true)
-        } else {
-            (Some(byte), false)
+        );
+        ParserStep {
+            byte: Some(if injected_reset { 0x18 } else { byte }),
+            entered_string: !was_string && is_string,
+            exited_string,
+            cancelled_string: exited_string && matches!(byte, 0x18 | 0x1a),
+            injected_reset,
         }
     }
 
@@ -200,6 +220,36 @@ pub struct Screen {
     cols: u16,
     lines: Vec<String>,
     text: String,
+    control_checkpoint: Option<CallbackCheckpoint>,
+}
+
+#[derive(Clone)]
+struct CallbackCheckpoint {
+    title: String,
+    bells: u64,
+    progress: Option<Progress>,
+    observed_reports: usize,
+    event: bool,
+}
+
+impl CallbackCheckpoint {
+    fn capture(callbacks: &Callbacks) -> Self {
+        Self {
+            title: callbacks.title.clone(),
+            bells: callbacks.bells,
+            progress: callbacks.progress,
+            observed_reports: callbacks.observed_reports.len(),
+            event: callbacks.event,
+        }
+    }
+
+    fn restore(self, callbacks: &mut Callbacks) {
+        callbacks.title = self.title;
+        callbacks.bells = self.bells;
+        callbacks.progress = self.progress;
+        callbacks.observed_reports.truncate(self.observed_reports);
+        callbacks.event = self.event;
+    }
 }
 
 impl Screen {
@@ -218,6 +268,7 @@ impl Screen {
             cols,
             lines: Vec::new(),
             text: String::new(),
+            control_checkpoint: None,
         };
         value.refresh_window();
         value
@@ -229,38 +280,45 @@ impl Screen {
             self.parser.screen().cursor_position(),
             self.parser.screen().alternate_screen(),
         );
-        let callback_snapshot = {
-            let callbacks = self.parser.callbacks();
-            (
-                callbacks.title.clone(),
-                callbacks.bells,
-                callbacks.progress,
-                callbacks.observed_reports.len(),
-            )
-        };
         self.parser.callbacks_mut().event = false;
         let mut filtered = Vec::with_capacity(bytes.len().min(8192));
-        let mut discarded_control = false;
         for &byte in bytes {
-            let (parser_byte, injected_reset) = self.boundary.parser_byte(byte);
-            discarded_control |= injected_reset;
-            if let Some(byte) = parser_byte {
-                filtered.push(byte);
-                if filtered.len() == 8192 {
+            let step = self.boundary.parser_byte(byte);
+            if step.entered_string {
+                self.parser.process(&filtered);
+                filtered.clear();
+                self.control_checkpoint =
+                    Some(CallbackCheckpoint::capture(self.parser.callbacks()));
+            }
+            if let Some(parser_byte) = step.byte {
+                if step.entered_string {
+                    match byte {
+                        0x90 => filtered.extend_from_slice(b"\x1bP"),
+                        0x98 => filtered.extend_from_slice(b"\x1bX"),
+                        0x9d => filtered.extend_from_slice(b"\x1b]"),
+                        0x9e => filtered.extend_from_slice(b"\x1b^"),
+                        0x9f => filtered.extend_from_slice(b"\x1b_"),
+                        _ => filtered.push(parser_byte),
+                    }
+                } else if step.exited_string && byte == 0x9c {
+                    filtered.extend_from_slice(b"\x1b\\");
+                } else {
+                    filtered.push(parser_byte);
+                }
+                if filtered.len() >= 8192 || step.injected_reset || step.exited_string {
                     self.parser.process(&filtered);
                     filtered.clear();
                 }
             }
+            if step.injected_reset || step.cancelled_string {
+                if let Some(checkpoint) = self.control_checkpoint.take() {
+                    checkpoint.restore(self.parser.callbacks_mut());
+                }
+            } else if step.exited_string {
+                self.control_checkpoint = None;
+            }
         }
         self.parser.process(&filtered);
-        if discarded_control {
-            let callbacks = self.parser.callbacks_mut();
-            callbacks.title = callback_snapshot.0;
-            callbacks.bells = callback_snapshot.1;
-            callbacks.progress = callback_snapshot.2;
-            callbacks.observed_reports.truncate(callback_snapshot.3);
-            callbacks.event = false;
-        }
         let after = self.parser.screen();
         self.changed = before
             != (
@@ -400,7 +458,14 @@ mod tests {
         for (start, end) in [
             (b"\x1b]2;".as_slice(), b"\x07".as_slice()),
             (b"\x1bP".as_slice(), b"\x1b\\".as_slice()),
+            (b"\x1bX".as_slice(), b"\x1b\\".as_slice()),
+            (b"\x1b^".as_slice(), b"\x1b\\".as_slice()),
             (b"\x1b_".as_slice(), b"\x1b\\".as_slice()),
+            (b"\x9d2;".as_slice(), b"\x9c".as_slice()),
+            (b"\x90".as_slice(), b"\x9c".as_slice()),
+            (b"\x98".as_slice(), b"\x9c".as_slice()),
+            (b"\x9e".as_slice(), b"\x9c".as_slice()),
+            (b"\x9f".as_slice(), b"\x9c".as_slice()),
         ] {
             let mut screen = Screen::new(4, 20);
             assert!(!screen.process(start));
@@ -441,6 +506,36 @@ mod tests {
         screen.process(b"\x1b]2;kept\x07\x18");
         assert_eq!(screen.title(), "kept");
         assert!(screen.ground());
+    }
+
+    #[test]
+    fn overflow_rolls_back_only_its_string_with_valid_callbacks_on_both_sides() {
+        let mut bytes = b"\x07\x1b]2;oversized;".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', MAX_CONTROL_STRING_BYTES + 1));
+        bytes.extend_from_slice(b"\x07\x1b]2;after\x07");
+        let mut screen = Screen::new(4, 20);
+        assert!(screen.process(&bytes));
+        assert_eq!(screen.bell_count(), 1, "valid callback before overflow");
+        assert_eq!(screen.title(), "after", "valid callback after overflow");
+    }
+
+    #[test]
+    fn split_c1_st_terminates_normally_and_can_sub_cancel_overflow() {
+        let mut screen = Screen::new(4, 20);
+        assert!(!screen.process(b"\x9d2;c1-title"));
+        assert!(screen.process(b"\x9c"));
+        assert_eq!(screen.title(), "c1-title");
+
+        for cancel in [0x18, 0x1a] {
+            let mut screen = Screen::new(4, 20);
+            assert!(!screen.process(b"\x1b]2;"));
+            let chunk = vec![b'x'; MAX_CONTROL_STRING_BYTES + 1];
+            assert!(!screen.process(&chunk));
+            assert!(screen.process(&[cancel]));
+            assert!(screen.process(b"recovered"));
+            assert_eq!(screen.text(), "recovered\n");
+            assert_eq!(screen.title(), "");
+        }
     }
 
     #[test]
