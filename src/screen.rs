@@ -322,6 +322,55 @@ mod tests {
     }
 
     #[test]
+    fn titles_clear_strip_controls_and_cap_length() {
+        // Phase Z §1: child titles are sanitized, bounded, and explicitly clearable.
+        let mut screen = Screen::new(4, 400);
+        let long = "x".repeat(300);
+        screen.process(format!("\x1b]2;a\x01b\x07\x1b]2;{long}\x07").as_bytes());
+        assert_eq!(screen.title().chars().count(), 256);
+        screen.process(b"\x1b]2;\x07");
+        assert_eq!(screen.title(), "");
+    }
+
+    #[test]
+    fn progress_accepts_all_states_and_ignores_malformed_reports() {
+        // Phase Z §1: OSC 9;4 recognizes states 0-3 without losing the prior valid report.
+        let mut screen = Screen::new(4, 20);
+        for state in 0..=3 {
+            screen.process(format!("\x1b]9;4;{state};25\x07").as_bytes());
+            let expected = if state == 0 {
+                Progress {
+                    state: 0,
+                    percent: 0,
+                }
+            } else {
+                Progress { state, percent: 25 }
+            };
+            assert_eq!(screen.progress(), Some(expected));
+        }
+        screen.process(b"\x1b]9;4;9;200\x07");
+        assert_eq!(
+            screen.progress(),
+            Some(Progress {
+                state: 3,
+                percent: 25
+            })
+        );
+    }
+
+    #[test]
+    fn wide_glyph_appears_once_and_alternate_screen_is_separate() {
+        // Phase Z §1: detection text emits wide glyphs once and follows the active screen.
+        let mut screen = Screen::new(3, 10);
+        screen.process("界".as_bytes());
+        assert_eq!(screen.text(), "界\n");
+        screen.process(b"\x1b[?1049halt\x1b[Halt");
+        assert_eq!(screen.text(), "alt\n");
+        screen.process(b"\x1b[?1049l");
+        assert_eq!(screen.text(), "界\n");
+    }
+
+    #[test]
     fn repainting_identical_content_is_unchanged() {
         // Phase Z §1: identical terminal state does not trigger rule evaluation.
         let mut screen = Screen::new(4, 20);
