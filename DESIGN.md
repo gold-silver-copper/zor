@@ -457,3 +457,11 @@ agent, zor accepts 21337 as a self-report alongside 7877 and the contract docume
   documenting the OSC as a contract agents may adopt. If zor sees the agent inside it emit OSC
   7877, a screen-visible blocker still outranks the agent's self-report; otherwise the
   self-report wins over the rules.
+
+- **Execution clarification (3 Sep 2026):** zor 0.1 passes child-emitted OSC 7877 through and logs
+  it in debug mode; it does not reinterpret or resequence it. fux applies reports in arrival order,
+  with `seq` used only to deduplicate identical consecutive reports. This replaces the speculative
+  precedence rule above until self-report provenance can be authenticated.
+- **Execution clarification (3 Sep 2026):** vt100 0.16.2 has no public ground-state query. zor uses
+  a separate streaming ECMA-48 boundary tracker and a single ordered stdout owner; title modes
+  append a zor title only at a safe boundary rather than editing bytes already emitted.

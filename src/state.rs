@@ -1,7 +1,4 @@
-use crate::{
-    osc::{AgentId, Flags, State},
-    rules::{RuleState, Verdict},
-};
+use crate::osc::{AgentId, Flags, State};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
@@ -47,8 +44,23 @@ pub enum Event {
     AgentLost,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationState {
+    Working,
+    Blocked,
+    Idle,
+    Skip,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Observation {
+    pub state: ObservationState,
+    pub visible: Flags,
+}
+
 struct Hold {
     opened: Instant,
+    next_confirmation: Instant,
     confirmations: u8,
 }
 
@@ -80,7 +92,7 @@ impl Machine {
 
     pub fn observe(
         &mut self,
-        verdict: Option<Verdict>,
+        verdict: Option<Observation>,
         agent: Option<AgentId>,
         pid: Option<i32>,
         exited: bool,
@@ -109,15 +121,15 @@ impl Machine {
             self.hold = None;
             return events;
         };
-        if verdict.state == RuleState::Skip {
+        if verdict.state == ObservationState::Skip {
             self.hold = None;
             return events;
         }
         let state = match verdict.state {
-            RuleState::Working => State::Working,
-            RuleState::Blocked => State::Blocked,
-            RuleState::Idle => State::Idle,
-            RuleState::Skip => return events,
+            ObservationState::Working => State::Working,
+            ObservationState::Blocked => State::Blocked,
+            ObservationState::Idle => State::Idle,
+            ObservationState::Skip => return events,
         };
         if state == State::Idle && self.grace_until.is_some_and(|deadline| now < deadline) {
             self.hold = None;
@@ -127,6 +139,7 @@ impl Machine {
         if held {
             if let Some(hold) = &mut self.hold {
                 hold.confirmations = hold.confirmations.saturating_add(1);
+                hold.next_confirmation = now + self.config.confirmation;
                 if hold.confirmations > self.config.confirmations {
                     self.hold = None;
                     events.push(self.publish(state, verdict.visible, false, now));
@@ -134,6 +147,7 @@ impl Machine {
             } else if agent.is_some() {
                 self.hold = Some(Hold {
                     opened: now,
+                    next_confirmation: now + self.config.confirmation,
                     confirmations: 1,
                 });
             }
@@ -170,7 +184,8 @@ impl Machine {
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
         let hold = self.hold.as_ref().map(|hold| {
-            (hold.opened + self.config.confirmation).min(hold.opened + self.config.hold_cap)
+            hold.next_confirmation
+                .min(hold.opened + self.config.hold_cap)
         });
         match (hold, self.heartbeat_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -181,6 +196,10 @@ impl Machine {
     #[must_use]
     pub const fn current(&self) -> (State, Flags, u64) {
         (self.current, self.visible, self.seq)
+    }
+    #[must_use]
+    pub const fn hold_pending(&self) -> bool {
+        self.hold.is_some()
     }
 
     fn publish(&mut self, state: State, visible: Flags, exited: bool, now: Instant) -> Event {
@@ -203,15 +222,8 @@ impl Machine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::schema::Region;
-
-    fn verdict(state: RuleState, visible: Flags) -> Verdict {
-        Verdict {
-            state,
-            visible,
-            rule: None,
-            region: Region::Whole,
-        }
+    fn verdict(state: ObservationState, visible: Flags) -> Observation {
+        Observation { state, visible }
     }
     fn agent() -> Option<AgentId> {
         AgentId::new("test").ok()
@@ -226,7 +238,7 @@ mod tests {
             ..Config::default()
         });
         let _ = machine.observe(
-            Some(verdict(RuleState::Working, Flags::default())),
+            Some(verdict(ObservationState::Working, Flags::default())),
             agent(),
             Some(1),
             false,
@@ -236,7 +248,7 @@ mod tests {
             assert!(
                 machine
                     .observe(
-                        Some(verdict(RuleState::Idle, Flags::default())),
+                        Some(verdict(ObservationState::Idle, Flags::default())),
                         agent(),
                         Some(1),
                         false,
@@ -248,7 +260,7 @@ mod tests {
         assert!(matches!(
             machine
                 .observe(
-                    Some(verdict(RuleState::Idle, Flags::default())),
+                    Some(verdict(ObservationState::Idle, Flags::default())),
                     agent(),
                     Some(1),
                     false,
@@ -271,14 +283,14 @@ mod tests {
             ..Config::default()
         });
         let _ = machine.observe(
-            Some(verdict(RuleState::Working, Flags::default())),
+            Some(verdict(ObservationState::Working, Flags::default())),
             agent(),
             Some(1),
             false,
             start,
         );
         let _ = machine.observe(
-            Some(verdict(RuleState::Idle, Flags::default())),
+            Some(verdict(ObservationState::Idle, Flags::default())),
             agent(),
             Some(1),
             false,
@@ -292,7 +304,7 @@ mod tests {
             }]
         ));
         let _ = machine.observe(
-            Some(verdict(RuleState::Working, Flags::default())),
+            Some(verdict(ObservationState::Working, Flags::default())),
             agent(),
             Some(1),
             false,
@@ -302,7 +314,7 @@ mod tests {
             machine
                 .observe(
                     Some(verdict(
-                        RuleState::Idle,
+                        ObservationState::Idle,
                         Flags {
                             idle: true,
                             ..Flags::default()
@@ -331,7 +343,7 @@ mod tests {
         });
         let events = machine.observe(
             Some(verdict(
-                RuleState::Blocked,
+                ObservationState::Blocked,
                 Flags {
                     blocker: true,
                     ..Flags::default()
@@ -368,7 +380,7 @@ mod tests {
         let start = Instant::now();
         let mut machine = Machine::new(Config::default());
         let found = machine.observe(
-            Some(verdict(RuleState::Idle, Flags::default())),
+            Some(verdict(ObservationState::Idle, Flags::default())),
             agent(),
             Some(1),
             false,
@@ -378,7 +390,7 @@ mod tests {
         assert!(matches!(
             machine
                 .observe(
-                    Some(verdict(RuleState::Blocked, Flags::default())),
+                    Some(verdict(ObservationState::Blocked, Flags::default())),
                     agent(),
                     Some(1),
                     false,
@@ -401,14 +413,14 @@ mod tests {
             ..Config::default()
         });
         let _ = machine.observe(
-            Some(verdict(RuleState::Working, Flags::default())),
+            Some(verdict(ObservationState::Working, Flags::default())),
             agent(),
             Some(1),
             false,
             start,
         );
         let _ = machine.observe(
-            Some(verdict(RuleState::Idle, Flags::default())),
+            Some(verdict(ObservationState::Idle, Flags::default())),
             agent(),
             Some(1),
             false,
@@ -418,7 +430,7 @@ mod tests {
         assert!(
             machine
                 .observe(
-                    Some(verdict(RuleState::Skip, Flags::default())),
+                    Some(verdict(ObservationState::Skip, Flags::default())),
                     agent(),
                     Some(1),
                     false,
@@ -429,7 +441,7 @@ mod tests {
         assert!(machine.tick(start + Duration::from_millis(700)).is_empty());
         let changed = machine.observe(
             Some(verdict(
-                RuleState::Working,
+                ObservationState::Working,
                 Flags {
                     working: true,
                     ..Flags::default()
@@ -458,7 +470,7 @@ mod tests {
             ..Config::default()
         });
         let _ = machine.observe(
-            Some(verdict(RuleState::Working, Flags::default())),
+            Some(verdict(ObservationState::Working, Flags::default())),
             agent(),
             Some(1),
             false,

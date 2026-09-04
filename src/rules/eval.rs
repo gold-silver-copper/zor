@@ -14,9 +14,12 @@ pub struct Verdict {
 
 pub fn evaluate(set: &RuleSet, view: &impl ScreenView) -> Verdict {
     let mut winner = None;
+    let mut regions = std::collections::HashMap::new();
     for rule in &set.rules {
-        let text = region_text(rule.region, set, view);
-        if gate_matches(&rule.gate, &text)
+        let text = regions
+            .entry(rule.region)
+            .or_insert_with(|| region_text(rule.region, set, view));
+        if gate_matches(&rule.gate, text)
             && winner
                 .as_ref()
                 .is_none_or(|(priority, _, _): &(i32, usize, String)| rule.priority > *priority)
@@ -52,18 +55,29 @@ pub fn evaluate(set: &RuleSet, view: &impl ScreenView) -> Verdict {
 
 fn gate_matches(gate: &Gate, text: &str) -> bool {
     let lower = text.to_lowercase();
+    gate_matches_with_lower(gate, text, &lower)
+}
+
+fn gate_matches_with_lower(gate: &Gate, text: &str, lower: &str) -> bool {
     gate.contains.iter().all(|needle| lower.contains(needle))
+        && gate.compiled_regex.iter().all(|value| value.is_match(text))
         && gate
-            .regex
+            .compiled_line_regex
             .iter()
-            .all(|pattern| regex::Regex::new(pattern).is_ok_and(|value| value.is_match(text)))
-        && gate.line_regex.iter().all(|pattern| {
-            regex::Regex::new(pattern)
-                .is_ok_and(|value| text.lines().any(|line| value.is_match(line)))
-        })
-        && gate.all.iter().all(|child| gate_matches(child, text))
-        && (gate.any.is_empty() || gate.any.iter().any(|child| gate_matches(child, text)))
-        && gate.not.iter().all(|child| !gate_matches(child, text))
+            .all(|value| text.lines().any(|line| value.is_match(line)))
+        && gate
+            .all
+            .iter()
+            .all(|child| gate_matches_with_lower(child, text, lower))
+        && (gate.any.is_empty()
+            || gate
+                .any
+                .iter()
+                .any(|child| gate_matches_with_lower(child, text, lower)))
+        && gate
+            .not
+            .iter()
+            .all(|child| !gate_matches_with_lower(child, text, lower))
 }
 
 fn region_text(region: Region, set: &RuleSet, view: &impl ScreenView) -> String {
@@ -117,6 +131,31 @@ fn region_text(region: Region, set: &RuleSet, view: &impl ScreenView) -> String 
                     ),
                     _ => String::new(),
                 }
+            }
+        }
+        Region::AbovePromptBox | Region::LastLineAbovePromptBox => {
+            let rules: Vec<_> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| horizontal_rule(line))
+                .map(|(index, _)| index)
+                .collect();
+            let end = if rules.len() >= 2 {
+                rules.get(rules.len().saturating_sub(2)).copied()
+            } else {
+                None
+            };
+            let above = end.map_or(lines.as_slice(), |index| {
+                lines.get(..index).unwrap_or_default()
+            });
+            if region == Region::LastLineAbovePromptBox {
+                above
+                    .iter()
+                    .rev()
+                    .find(|line| !line.is_empty())
+                    .map_or_else(String::new, |line| join(std::slice::from_ref(line)))
+            } else {
+                join(above)
             }
         }
         Region::AfterLastRule => lines
@@ -265,5 +304,10 @@ contains = ["ready"]
         assert_eq!(region_text(Region::AfterLastRule, &set, &view), "after\n");
         assert!(!horizontal_rule("---"));
         assert!(horizontal_rule("──"));
+        assert_eq!(region_text(Region::AbovePromptBox, &set, &view), "old\n");
+        assert_eq!(
+            region_text(Region::LastLineAbovePromptBox, &set, &view),
+            "old\n"
+        );
     }
 }

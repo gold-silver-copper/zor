@@ -7,10 +7,17 @@ use std::{
     os::unix::ffi::OsStrExt,
 };
 
-pub fn foreground_pgid(child: Pid) -> Option<Pid> {
+pub fn foreground_pgid(child: Pid, master_fd: Option<i32>) -> Option<Pid> {
     stat(child)
         .map(|value| value.tpgid)
         .filter(|value| *value > 0)
+        .or_else(|| unsafe {
+            // SAFETY: tcgetpgrp only inspects the supplied live PTY descriptor.
+            master_fd.and_then(|fd| {
+                let pgid = libc::tcgetpgrp(fd);
+                (pgid > 0).then_some(pgid)
+            })
+        })
 }
 pub fn leader(pgid: Pid) -> Option<Process> {
     process(pgid).filter(|_| stat(pgid).is_some_and(|value| value.pgrp == pgid))

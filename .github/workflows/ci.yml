@@ -22,6 +22,10 @@ jobs:
       - run: cargo test --locked --no-default-features
       - name: Check protocol-layer isolation
         run: '! rg "crate::(emit|platform|pty|rules|screen|state)" src/osc.rs'
+      - name: Check rules and state layering
+        run: |
+          ! rg 'crate::(pty|platform|emit)' src/rules
+          ! rg 'crate::(pty|platform|emit|screen|rules)' src/state.rs
 
   android-protocol:
     runs-on: ubuntu-latest

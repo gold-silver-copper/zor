@@ -214,6 +214,13 @@ impl Screen {
     pub fn take_observed_reports(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.parser.callbacks_mut().observed_reports)
     }
+    pub fn clear_detection_evidence(&mut self) {
+        let callbacks = self.parser.callbacks_mut();
+        callbacks.title.clear();
+        callbacks.progress = None;
+        callbacks.event = true;
+        self.changed = true;
+    }
     #[must_use]
     pub fn bell_count(&self) -> u64 {
         self.parser.callbacks().bells

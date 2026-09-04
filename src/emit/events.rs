@@ -13,6 +13,7 @@ use std::{
 #[derive(Serialize)]
 pub struct EventLine<'a> {
     pub t: &'a str,
+    pub ts: f64,
     pub state: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous: Option<&'a str>,
@@ -30,22 +31,38 @@ pub struct EventLine<'a> {
     #[serde(skip_serializing_if = "is_false")]
     pub exited: bool,
 }
+
+#[derive(Serialize)]
+pub struct AgentLine<'a> {
+    pub t: &'static str,
+    pub agent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    pub ts: f64,
+}
+
+#[derive(Serialize)]
+pub struct ExitLine {
+    pub t: &'static str,
+    pub code: i32,
+    pub ts: f64,
+}
 fn is_false(value: &bool) -> bool {
     !value
 }
 
-pub fn encode(event: &EventLine<'_>) -> Result<Vec<u8>, serde_json::Error> {
+pub fn encode(event: &impl Serialize) -> Result<Vec<u8>, serde_json::Error> {
     let mut line = serde_json::to_vec(event)?;
     line.push(b'\n');
     Ok(line)
 }
 
 #[must_use]
-pub fn timestamp() -> String {
+pub fn timestamp() -> f64 {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{}.{:03}", duration.as_secs(), duration.subsec_millis())
+    duration.as_millis() as f64 / 1_000.0
 }
 
 enum Target {
@@ -123,13 +140,15 @@ fn open_target(path: &Path) -> io::Result<Target> {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     #[test]
     fn event_is_one_json_line() {
         // Phase Z §6: event output is parseable JSON Lines with optional fields omitted.
         let line = EventLine {
-            t: "1.000",
+            t: "state",
+            ts: 1.0,
             state: "idle",
             previous: None,
             agent: Some("a"),
@@ -142,7 +161,37 @@ mod tests {
         };
         let encoded = encode(&line).unwrap_or_default();
         assert_eq!(encoded.last(), Some(&b'\n'));
-        assert!(serde_json::from_slice::<serde_json::Value>(&encoded).is_ok());
+        let value = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap_or_default();
+        assert_eq!(value["t"], "state");
+        assert_eq!(value["ts"], 1.0);
+        assert_eq!(value["state"], "idle");
+        assert!(value.get("pid").is_none());
+    }
+
+    #[test]
+    fn agent_and_exit_lines_use_the_tagged_contract() {
+        // Phase Z §6: lifecycle lines carry their type, timestamp, and relevant payload.
+        let agent = encode(&AgentLine {
+            t: "agent",
+            agent: Some("claude"),
+            pid: Some(42),
+            ts: 2.0,
+        })
+        .unwrap_or_default();
+        let exit = encode(&ExitLine {
+            t: "exit",
+            code: 143,
+            ts: 3.0,
+        })
+        .unwrap_or_default();
+        let agent: serde_json::Value = serde_json::from_slice(&agent).unwrap_or_default();
+        let exit: serde_json::Value = serde_json::from_slice(&exit).unwrap_or_default();
+        assert_eq!(agent["t"], "agent");
+        assert_eq!(agent["pid"], 42);
+        assert_eq!(agent["ts"], 2.0);
+        assert_eq!(exit["t"], "exit");
+        assert_eq!(exit["code"], 143);
+        assert_eq!(exit["ts"], 3.0);
     }
 
     #[test]

@@ -2,13 +2,17 @@ use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySystem};
 use std::{
     io::{self, Read, Write},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
 };
 
 use crate::{
     emit::{
-        events::{EventLine, Sink, encode, timestamp},
+        events::{AgentLine, EventLine, ExitLine, Sink, encode, timestamp},
         title::{Mode as TitleMode, Titles},
     },
     osc::Report,
@@ -16,6 +20,50 @@ use crate::{
     screen::Screen,
     state::{Config, Event, Machine},
 };
+
+struct ChildCleanup {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    armed: bool,
+}
+
+struct ThreadCleanup {
+    cancel: Arc<AtomicBool>,
+    signals: signal_hook::iterator::Handle,
+    reader: Option<thread::JoinHandle<()>>,
+    writer: Option<thread::JoinHandle<()>>,
+    signal: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ThreadCleanup {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.signals.close();
+        if let Some(thread) = self.reader.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.writer.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.signal.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl ChildCleanup {
+    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+        Self { child, armed: true }
+    }
+}
+
+impl Drop for ChildCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
 
 pub struct Options {
     pub rule_sets: Vec<RuleSet>,
@@ -34,14 +82,28 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     let mut builder = CommandBuilder::new(command);
     builder.args(argv);
     builder.env("ZOR_PID", std::process::id().to_string());
-    let mut child = pair
+    let mut spawned_child = pair
         .slave
         .spawn_command(builder)
         .context("spawn wrapped command")?;
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
-    let mut writer = pair.master.take_writer().context("take pty writer")?;
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = spawned_child.kill();
+            let _ = spawned_child.wait();
+            return Err(error).context("clone pty reader");
+        }
+    };
+    let mut writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            let _ = spawned_child.kill();
+            let _ = spawned_child.wait();
+            return Err(error).context("take pty writer");
+        }
+    };
     enum Message {
         Chunk(Vec<u8>),
         Eof,
@@ -66,15 +128,42 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
         }
         let _ = reader_tx.send(Message::Eof);
     });
-    thread::spawn(move || {
-        let _ = io::copy(&mut io::stdin().lock(), &mut writer);
-        // A terminal has no pipe-style EOF. portable-pty's writer drop synthesizes
-        // VEOF, which can be echoed into stdout and violate byte passthrough.
-        std::mem::forget(writer);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let writer_cancel = Arc::clone(&cancel);
+    let writer_thread = thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        let mut bytes = [0_u8; 1024];
+        while !writer_cancel.load(Ordering::Relaxed) {
+            let mut descriptors = [nix::poll::PollFd::new(
+                std::os::fd::AsFd::as_fd(&stdin),
+                nix::poll::PollFlags::POLLIN,
+            )];
+            match nix::poll::poll(&mut descriptors, 100_u16) {
+                Ok(0) | Err(nix::errno::Errno::EINTR) => continue,
+                Ok(_) => match stdin.read(&mut bytes) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        if writer
+                            .write_all(bytes.get(..count).unwrap_or_default())
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                },
+                Err(_) => break,
+            }
+        }
+        // Closing a PTY master writer synthesizes VEOF, which can be echoed as child output.
+        // Retain it until the child has exited and the coordinator requests teardown.
+        while !writer_cancel.load(Ordering::Relaxed) {
+            thread::park_timeout(std::time::Duration::from_millis(10));
+        }
     });
 
     let signal_tx = output_tx;
-    let mut signals = signal_hook::iterator::Signals::new([
+    let signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGWINCH,
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
@@ -82,15 +171,35 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
         signal_hook::consts::SIGTSTP,
         signal_hook::consts::SIGCONT,
         signal_hook::consts::SIGUSR1,
-    ])
-    .context("register signal handlers")?;
-    thread::spawn(move || {
+    ]);
+    let mut signals = match signals {
+        Ok(signals) => signals,
+        Err(error) => {
+            cancel.store(true, Ordering::Relaxed);
+            let _ = spawned_child.kill();
+            let _ = spawned_child.wait();
+            let _ = reader_thread.join();
+            let _ = writer_thread.join();
+            return Err(error).context("register signal handlers");
+        }
+    };
+    let signal_handle = signals.handle();
+    let signal_thread = thread::spawn(move || {
         for signal in signals.forever() {
             if signal_tx.send(Message::Signal(signal)).is_err() {
                 break;
             }
         }
     });
+    let _threads = ThreadCleanup {
+        cancel: Arc::clone(&cancel),
+        signals: signal_handle,
+        reader: Some(reader_thread),
+        writer: Some(writer_thread),
+        signal: Some(signal_thread),
+    };
+    // Declared after the thread guard so failure unwinding kills the child before joining readers.
+    let mut child = ChildCleanup::new(spawned_child);
 
     // The main loop is the sole output owner: child bytes are flushed before parsing.
     let mut screen = Screen::new(initial_size.rows, initial_size.cols);
@@ -99,8 +208,22 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     let mut sink = options.events.clone().map(Sink::connect);
     let mut queued = Vec::<Vec<u8>>::new();
     let mut stdout = io::stdout().lock();
-    let child_pid = child.process_id().and_then(|pid| i32::try_from(pid).ok());
-    let mut active_agent = options.agent.clone();
+    let child_pid = child
+        .child
+        .process_id()
+        .and_then(|pid| i32::try_from(pid).ok());
+    let command_name = std::path::Path::new(command)
+        .file_name()
+        .and_then(|value| value.to_str());
+    let mut active_agent = options.agent.clone().or_else(|| {
+        command_name.and_then(|name| {
+            options
+                .rule_sets
+                .iter()
+                .find(|set| set.id == name || set.process_names.iter().any(|value| value == name))
+                .and_then(|set| crate::osc::AgentId::new(set.id.clone()).ok())
+        })
+    });
     let mut scheduler = crate::platform::probe::Scheduler::new(std::time::Instant::now());
     let mut last_pgid = None;
     let mut loss_tracker = crate::platform::probe::LossTracker::new();
@@ -113,7 +236,11 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
             Ok(Message::Signal(signal)) => {
                 if signal == signal_hook::consts::SIGWINCH {
                     let size = crate::platform::winsize(0);
-                    pair.master.resize(size).context("resize pty")?;
+                    restore_on_error(
+                        pair.master.resize(size).context("resize pty"),
+                        &titles,
+                        &mut stdout,
+                    )?;
                     screen.resize(size.rows, size.cols);
                 } else if signal == signal_hook::consts::SIGUSR1 {
                     write_fixture(&screen, options.agent.as_ref());
@@ -139,9 +266,18 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        let had_chunk = chunk.is_some();
         if let Some(chunk) = chunk {
-            stdout.write_all(&chunk).context("write child output")?;
-            stdout.flush().context("flush child output")?;
+            restore_on_error(
+                stdout.write_all(&chunk).context("write child output"),
+                &titles,
+                &mut stdout,
+            )?;
+            restore_on_error(
+                stdout.flush().context("flush child output"),
+                &titles,
+                &mut stdout,
+            )?;
             let _ = screen.process(&chunk);
             for payload in screen.take_observed_reports() {
                 if options.debug {
@@ -166,15 +302,16 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                 if active_agent.is_none() {
                     scheduler.screen_changed_without_agent(std::time::Instant::now());
                 }
-                let verdict = active_agent
+                let evaluated = active_agent
                     .as_ref()
                     .and_then(|id| options.rule_sets.iter().find(|set| set.id == id.as_str()))
                     .map(|set| evaluate(set, &screen));
                 if options.debug
-                    && let Some(value) = &verdict
+                    && let Some(value) = &evaluated
                 {
                     eprintln!("zor: verdict {:?} rule={:?}", value.state, value.rule);
                 }
+                let verdict = evaluated.as_ref().map(observation);
                 let events = machine.observe(
                     verdict,
                     active_agent.clone(),
@@ -194,20 +331,36 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
             }
         }
         let now = std::time::Instant::now();
+        if !had_chunk
+            && machine.hold_pending()
+            && machine
+                .next_deadline()
+                .is_some_and(|deadline| now >= deadline)
+        {
+            let verdict = active_agent
+                .as_ref()
+                .and_then(|id| options.rule_sets.iter().find(|set| set.id == id.as_str()))
+                .map(|set| observation(&evaluate(set, &screen)));
+            let events = machine.observe(verdict, active_agent.clone(), child_pid, false, now);
+            queue_events(
+                &events,
+                &options,
+                &screen,
+                &mut titles,
+                &mut sink,
+                &mut queued,
+            );
+        }
         if options.agent.is_none()
             && scheduler.due(now)
             && let Some(pid) = child_pid
         {
-            let pgid = crate::platform::foreground_pgid(pid);
+            let pgid = crate::platform::foreground_pgid(pid, pair.master.as_raw_fd());
             let no_pgid_full = scheduler.pgid_presence(pgid.is_some(), now);
             let changed = pgid != last_pgid;
             last_pgid = pgid;
-            let full = scheduler.completed(
-                now,
-                active_agent.is_some(),
-                machine.next_deadline().is_some(),
-                changed,
-            );
+            let full =
+                scheduler.completed(now, active_agent.is_some(), machine.hold_pending(), changed);
             if full || no_pgid_full {
                 let listed = pgid.map_or_else(
                     || crate::platform::Job {
@@ -219,16 +372,32 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                 let detected = crate::rules::ident::identify(&listed, &options.rule_sets);
                 let shell = listed.processes.iter().any(|process| process.pid == pid);
                 if let Some(outcome) = loss_tracker.update(detected, shell) {
-                    let (next, exited) = match outcome {
-                        crate::platform::probe::Detection::AgentFound { id, .. } => {
-                            (Some(id), false)
+                    let (next, event_pid, exited, found) = match outcome {
+                        crate::platform::probe::Detection::AgentFound { id, pid } => {
+                            (Some(id), Some(pid), false, true)
                         }
-                        crate::platform::probe::Detection::Exited { agent } => (Some(agent), true),
-                        crate::platform::probe::Detection::AgentLost => (None, false),
+                        crate::platform::probe::Detection::Exited { agent } => {
+                            (Some(agent), None, true, false)
+                        }
+                        crate::platform::probe::Detection::AgentLost => (None, None, false, false),
                     };
                     active_agent = next;
+                    if found {
+                        screen.clear_detection_evidence();
+                        last_title.clear();
+                    }
+                    let verdict = found
+                        .then(|| {
+                            active_agent
+                                .as_ref()
+                                .and_then(|id| {
+                                    options.rule_sets.iter().find(|set| set.id == id.as_str())
+                                })
+                                .map(|set| observation(&evaluate(set, &screen)))
+                        })
+                        .flatten();
                     let events =
-                        machine.observe(None, active_agent.clone(), child_pid, exited, now);
+                        machine.observe(verdict, active_agent.clone(), event_pid, exited, now);
                     queue_events(
                         &events,
                         &options,
@@ -251,27 +420,60 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
         );
         if screen.ground() {
             for bytes in queued.drain(..) {
-                stdout.write_all(&bytes)?;
-                stdout.flush()?;
+                restore_on_error(
+                    stdout.write_all(&bytes).context("write zor output"),
+                    &titles,
+                    &mut stdout,
+                )?;
+                restore_on_error(
+                    stdout.flush().context("flush zor output"),
+                    &titles,
+                    &mut stdout,
+                )?;
             }
         }
     }
-    let status = child.wait().context("wait for wrapped command")?;
-    let _ = reader_thread.join();
+    let status = restore_on_error(
+        child.child.wait().context("wait for wrapped command"),
+        &titles,
+        &mut stdout,
+    )?;
+    child.armed = false;
     if let Some(bytes) = titles.restore() {
         stdout.write_all(&bytes)?;
         stdout.flush()?;
+    }
+    let code = status
+        .signal()
+        .and_then(signal_number)
+        .map_or(status.exit_code(), |signal| 128 + signal);
+    let code = i32::try_from(code).unwrap_or(i32::MAX);
+    if let Some(target) = &mut sink {
+        let time = timestamp();
+        if let Ok(bytes) = encode(&ExitLine {
+            t: "exit",
+            code,
+            ts: time,
+        }) {
+            target.write(&bytes);
+        }
     }
     if options.debug
         && let Some(value) = sink
     {
         eprintln!("zor: dropped event lines: {}", value.dropped);
     }
-    let code = status
-        .signal()
-        .and_then(signal_number)
-        .map_or(status.exit_code(), |signal| 128 + signal);
     Ok(u8::try_from(code).unwrap_or(u8::MAX))
+}
+
+fn restore_on_error<T>(result: Result<T>, titles: &Titles, stdout: &mut impl Write) -> Result<T> {
+    if result.is_err()
+        && let Some(bytes) = titles.restore()
+    {
+        let _ = stdout.write_all(&bytes);
+        let _ = stdout.flush();
+    }
+    result
 }
 
 fn signal_number(name: &str) -> Option<u32> {
@@ -321,6 +523,14 @@ fn queue_events(
     for event in events {
         if options.debug {
             eprintln!("zor: machine event {event:?}");
+        }
+        if let Event::AgentFound { id, pid } = event {
+            write_agent_event(sink, Some(id), Some(*pid));
+            continue;
+        }
+        if matches!(event, Event::AgentLost) {
+            write_agent_event(sink, None, None);
+            continue;
         }
         let Event::Changed {
             state,
@@ -400,7 +610,8 @@ fn write_event_line(
     .filter_map(|(set, name)| set.then_some(name))
     .collect();
     let line = EventLine {
-        t: &time,
+        t: "state",
+        ts: time,
         state: state_name(state),
         previous: previous.map(state_name),
         agent: agent.map(crate::osc::AgentId::as_str),
@@ -415,12 +626,43 @@ fn write_event_line(
         target.write(&bytes);
     }
 }
+
+fn write_agent_event(
+    sink: &mut Option<Sink>,
+    agent: Option<&crate::osc::AgentId>,
+    pid: Option<i32>,
+) {
+    let Some(target) = sink else { return };
+    let time = timestamp();
+    let line = AgentLine {
+        t: "agent",
+        agent: agent.map(crate::osc::AgentId::as_str),
+        pid,
+        ts: time,
+    };
+    if let Ok(bytes) = encode(&line) {
+        target.write(&bytes);
+    }
+}
 fn state_name(state: crate::osc::State) -> &'static str {
     match state {
         crate::osc::State::Working => "working",
         crate::osc::State::Blocked => "blocked",
         crate::osc::State::Idle => "idle",
         crate::osc::State::None => "none",
+    }
+}
+
+fn observation(verdict: &crate::rules::Verdict) -> crate::state::Observation {
+    use crate::{rules::RuleState, state::ObservationState};
+    crate::state::Observation {
+        state: match verdict.state {
+            RuleState::Working => ObservationState::Working,
+            RuleState::Blocked => ObservationState::Blocked,
+            RuleState::Idle => ObservationState::Idle,
+            RuleState::Skip => ObservationState::Skip,
+        },
+        visible: verdict.visible,
     }
 }
 

@@ -2,7 +2,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::{fmt, path::Path, str::FromStr};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum Region {
     #[default]
     Whole,
@@ -11,6 +11,8 @@ pub enum Region {
     BottomNonEmpty(usize),
     TopNonEmpty(usize),
     PromptBox,
+    AbovePromptBox,
+    LastLineAbovePromptBox,
     AfterLastRule,
     AfterLastPromptMarker,
     WholeUnlessAtPrompt,
@@ -31,6 +33,8 @@ impl FromStr for Region {
         let simple = match value {
             "whole" => Some(Self::Whole),
             "prompt_box" => Some(Self::PromptBox),
+            "above_prompt_box" => Some(Self::AbovePromptBox),
+            "last_line_above_prompt_box" => Some(Self::LastLineAbovePromptBox),
             "after_last_rule" => Some(Self::AfterLastRule),
             "after_last_prompt_marker" => Some(Self::AfterLastPromptMarker),
             "whole_unless_at_prompt" => Some(Self::WholeUnlessAtPrompt),
@@ -83,6 +87,10 @@ pub struct Gate {
     pub any: Vec<Gate>,
     #[serde(default)]
     pub not: Vec<Gate>,
+    #[serde(skip)]
+    pub(crate) compiled_regex: Vec<Regex>,
+    #[serde(skip)]
+    pub(crate) compiled_line_regex: Vec<Regex>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -236,6 +244,16 @@ fn validate_gate(
             )));
         }
     }
+    gate.compiled_regex = gate
+        .regex
+        .iter()
+        .filter_map(|value| Regex::new(value).ok())
+        .collect();
+    gate.compiled_line_regex = gate
+        .line_regex
+        .iter()
+        .filter_map(|value| Regex::new(value).ok())
+        .collect();
     for child in gate
         .all
         .iter_mut()

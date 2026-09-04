@@ -1,7 +1,68 @@
+#![allow(clippy::indexing_slicing)]
+
 use std::{
     io::{Read, Write},
     process::{Command, Stdio},
 };
+
+#[test]
+fn lifecycle_events_follow_the_tagged_json_contract() -> Result<(), Box<dyn std::error::Error>> {
+    // Phase Z §6: public runtime emits agent, state, and final exit records with timestamps.
+    let root = std::env::temp_dir().join(format!("zor-events-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("rules"))?;
+    std::fs::write(
+        root.join("rules/test.toml"),
+        "id='test'\nprompt_marker='>'\nblock_markers=[]\n[[rules]]\nid='ready'\nstate='working'\ncontains=['READY']\n",
+    )?;
+    let socket = root.join("events.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+    let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let (mut stream, _) = listener.accept()?;
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_zor"))
+        .args([
+            "--events",
+            socket.to_str().ok_or("non-utf8 socket")?,
+            "--rules",
+            root.join("rules").to_str().ok_or("non-utf8 rules")?,
+            "--agent",
+            "test",
+            "--title",
+            "never",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf READY",
+        ])
+        .output()?;
+    assert!(output.status.success());
+    let bytes = reader.join().map_err(|_| "event reader panicked")??;
+    let lines: Vec<serde_json::Value> = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice)
+        .collect::<Result<_, _>>()?;
+    assert!(lines.iter().any(|line| {
+        line["t"] == "agent"
+            && line["agent"] == "test"
+            && line["pid"].as_i64().is_some_and(|pid| pid > 0)
+            && line["ts"].is_number()
+    }));
+    assert!(lines.iter().any(|line| {
+        line["t"] == "state" && line["state"] == "working" && line["ts"].is_number()
+    }));
+    assert!(
+        lines
+            .iter()
+            .any(|line| { line["t"] == "exit" && line["code"] == 0 && line["ts"].is_number() })
+    );
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
 
 #[test]
 fn child_control_bytes_are_forwarded_exactly() -> Result<(), Box<dyn std::error::Error>> {

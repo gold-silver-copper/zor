@@ -3,7 +3,7 @@ use super::{Job, Pid, Process};
 use std::{ffi::CStr, io};
 const PROC_PGRP_ONLY: u32 = 2;
 
-pub fn foreground_pgid(child: Pid) -> Option<Pid> {
+pub fn foreground_pgid(child: Pid, _: Option<i32>) -> Option<Pid> {
     info(child)
         .map(|value| value.e_tpgid as Pid)
         .filter(|value| *value > 0)
