@@ -350,7 +350,21 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     let mut last_pgid = None;
     let mut loss_tracker = crate::platform::probe::LossTracker::new();
     let mut last_title = String::new();
+    let mut current_size = initial_size;
     loop {
+        // Some PTY hosts update the wrapper's controlling terminal without delivering SIGWINCH
+        // to its process group. Polling alongside the already bounded 50 ms event wait keeps the
+        // child PTY authoritative on those hosts while the signal path remains the fast path.
+        let observed_size = clamp_size(crate::platform::winsize(0));
+        if observed_size.rows != current_size.rows || observed_size.cols != current_size.cols {
+            restore_on_error(
+                pair.master.resize(observed_size).context("resize pty"),
+                &titles,
+                &mut stdout,
+            )?;
+            screen.resize(observed_size.rows, observed_size.cols);
+            current_size = observed_size;
+        }
         let message = take_pending_signal(&pending_signals).map_or_else(
             || output_rx.recv_timeout(std::time::Duration::from_millis(50)),
             |signal| Ok(Message::Signal(signal)),
@@ -367,6 +381,7 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                         &mut stdout,
                     )?;
                     screen.resize(size.rows, size.cols);
+                    current_size = size;
                 } else if signal == signal_hook::consts::SIGUSR1 {
                     write_fixture(&screen, options.agent.as_ref());
                 } else if signal == signal_hook::consts::SIGTSTP {

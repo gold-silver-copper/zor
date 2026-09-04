@@ -122,6 +122,57 @@ fn terminal_response_reaches_child_stdin() -> Result<(), Box<dyn std::error::Err
 }
 
 #[test]
+fn outer_pty_resize_reaches_the_wrapped_child_terminal() -> Result<(), Box<dyn std::error::Error>> {
+    use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem as _};
+    let pair = NativePtySystem::default().openpty(PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_zor"));
+    command.args([
+        "--title",
+        "never",
+        "--",
+        "/bin/sh",
+        "-c",
+        "stty raw -echo; printf 'READY\\n'; dd bs=1 count=1 >/dev/null 2>&1; stty size",
+    ]);
+    let mut child = pair.slave.spawn_command(command)?;
+    drop(pair.slave);
+    let mut reader = BufReader::new(pair.master.try_clone_reader()?);
+    let mut writer = pair.master.take_writer()?;
+    let mut ready = String::new();
+    reader.read_line(&mut ready)?;
+    assert_eq!(ready.trim(), "READY");
+    pair.master.resize(PtySize {
+        rows: 40,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+    thread::sleep(Duration::from_millis(150));
+    writer.write_all(b"x")?;
+    writer.flush()?;
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader_thread = thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = reader.read_to_end(&mut output).map(|_| output);
+        let _ = send.send(result);
+    });
+    assert!(child.wait()?.success());
+    let output = receive.recv_timeout(Duration::from_secs(2))??;
+    reader_thread.join().map_err(|_| "resize reader panicked")?;
+    let output = String::from_utf8_lossy(&output);
+    assert!(
+        output.contains("40 120"),
+        "wrapped child size output: {output:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn split_control_string_is_never_interleaved() -> Result<(), Box<dyn std::error::Error>> {
     // Phase Z §5: a control string split across writes remains byte-identical.
     let output = Command::new(env!("CARGO_BIN_EXE_zor"))
