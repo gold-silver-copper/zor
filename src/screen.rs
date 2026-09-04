@@ -197,6 +197,10 @@ impl Screen {
     pub const fn changed(&self) -> bool {
         self.changed
     }
+    #[must_use]
+    pub const fn ground(&self) -> bool {
+        self.boundary.ground()
+    }
     pub fn clear_changed(&mut self) {
         self.changed = false;
     }

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use portable_pty::{CommandBuilder, NativePtySystem, PtySystem};
 use std::{
     io::{self, Read, Write},
     sync::mpsc,
@@ -28,14 +28,9 @@ pub struct Options {
 
 pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     let system = NativePtySystem::default();
-    let pair = system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .context("open pty")?;
+    let initial_size = crate::platform::winsize(0);
+    let _raw_guard = crate::platform::set_raw(0).ok();
+    let pair = system.openpty(initial_size).context("open pty")?;
     let mut builder = CommandBuilder::new(command);
     builder.args(argv);
     builder.env("ZOR_PID", std::process::id().to_string());
@@ -47,7 +42,13 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
 
     let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
     let mut writer = pair.master.take_writer().context("take pty writer")?;
-    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+    enum Message {
+        Chunk(Vec<u8>),
+        Eof,
+        Signal(i32),
+    }
+    let (output_tx, output_rx) = mpsc::channel::<Message>();
+    let reader_tx = output_tx.clone();
     let reader_thread = thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -57,51 +58,93 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                     let Some(chunk) = buffer.get(..count) else {
                         break;
                     };
-                    if output_tx.send(chunk.to_vec()).is_err() {
+                    if reader_tx.send(Message::Chunk(chunk.to_vec())).is_err() {
                         break;
                     }
                 }
             }
         }
+        let _ = reader_tx.send(Message::Eof);
     });
     thread::spawn(move || {
         let _ = io::copy(&mut io::stdin().lock(), &mut writer);
     });
 
+    let signal_tx = output_tx;
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGWINCH,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGTSTP,
+        signal_hook::consts::SIGCONT,
+        signal_hook::consts::SIGUSR1,
+    ])
+    .context("register signal handlers")?;
+    thread::spawn(move || {
+        for signal in signals.forever() {
+            if signal_tx.send(Message::Signal(signal)).is_err() {
+                break;
+            }
+        }
+    });
+
     // The main loop is the sole output owner: child bytes are flushed before parsing.
-    let mut screen = Screen::new(24, 80);
+    let mut screen = Screen::new(initial_size.rows, initial_size.cols);
     let mut machine = Machine::new(Config::default());
     let mut titles = Titles::new(options.title);
     let mut sink = options.events.clone().map(Sink::connect);
     let mut queued = Vec::<Vec<u8>>::new();
     let mut stdout = io::stdout().lock();
-    for chunk in output_rx {
-        stdout.write_all(&chunk).context("write child output")?;
-        stdout.flush().context("flush child output")?;
-        let ground = screen.process(&chunk);
-        if screen.changed() {
-            let verdict = options.rule_set.as_ref().map(|set| evaluate(set, &screen));
-            if options.debug
-                && let Some(value) = &verdict
-            {
-                eprintln!("zor: verdict {:?} rule={:?}", value.state, value.rule);
+    let child_pid = child.process_id().and_then(|pid| i32::try_from(pid).ok());
+    loop {
+        let message = output_rx.recv_timeout(std::time::Duration::from_millis(50));
+        let chunk = match message {
+            Ok(Message::Chunk(chunk)) => Some(chunk),
+            Ok(Message::Eof) => break,
+            Ok(Message::Signal(signal)) => {
+                if signal == signal_hook::consts::SIGWINCH {
+                    let size = crate::platform::winsize(0);
+                    pair.master.resize(size).context("resize pty")?;
+                    screen.resize(size.rows, size.cols);
+                } else if signal == signal_hook::consts::SIGUSR1 {
+                    write_fixture(&screen, options.agent.as_ref());
+                } else if let Some(pid) = child_pid {
+                    let _ = crate::platform::forward_signal(pid, signal);
+                }
+                None
             }
-            let events = machine.observe(
-                verdict,
-                options.agent.clone(),
-                child.process_id().and_then(|pid| i32::try_from(pid).ok()),
-                false,
-                std::time::Instant::now(),
-            );
-            queue_events(
-                &events,
-                &options,
-                &screen,
-                &mut titles,
-                &mut sink,
-                &mut queued,
-            );
-            screen.clear_changed();
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if let Some(chunk) = chunk {
+            stdout.write_all(&chunk).context("write child output")?;
+            stdout.flush().context("flush child output")?;
+            let _ = screen.process(&chunk);
+            if screen.changed() {
+                let verdict = options.rule_set.as_ref().map(|set| evaluate(set, &screen));
+                if options.debug
+                    && let Some(value) = &verdict
+                {
+                    eprintln!("zor: verdict {:?} rule={:?}", value.state, value.rule);
+                }
+                let events = machine.observe(
+                    verdict,
+                    options.agent.clone(),
+                    child_pid,
+                    false,
+                    std::time::Instant::now(),
+                );
+                queue_events(
+                    &events,
+                    &options,
+                    &screen,
+                    &mut titles,
+                    &mut sink,
+                    &mut queued,
+                );
+                screen.clear_changed();
+            }
         }
         let timer_events = machine.tick(std::time::Instant::now());
         queue_events(
@@ -112,7 +155,7 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
             &mut sink,
             &mut queued,
         );
-        if ground {
+        if screen.ground() {
             for bytes in queued.drain(..) {
                 stdout.write_all(&bytes)?;
                 stdout.flush()?;
@@ -131,6 +174,28 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
         eprintln!("zor: dropped event lines: {}", value.dropped);
     }
     Ok(u8::try_from(status.exit_code()).unwrap_or(u8::MAX))
+}
+
+fn write_fixture(screen: &Screen, agent: Option<&crate::osc::AgentId>) {
+    use crate::rules::view::ScreenView;
+    let path = std::env::temp_dir().join(format!(
+        "zor-fixture-{}-{}.txt",
+        std::process::id(),
+        timestamp()
+    ));
+    let progress = screen.progress().map_or_else(String::new, |value| {
+        format!("{}:{}", value.state, value.percent)
+    });
+    let body = format!(
+        "# agent: {}\n# title: {}\n# progress: {progress}\n# expect: idle\n# matched: none\n{}",
+        agent.map_or("unknown", crate::osc::AgentId::as_str),
+        screen.title(),
+        screen.text()
+    );
+    match std::fs::write(&path, body) {
+        Ok(()) => eprintln!("zor: fixture written to {}", path.display()),
+        Err(error) => eprintln!("zor: failed to write fixture: {error}"),
+    }
 }
 
 fn queue_events(

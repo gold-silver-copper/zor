@@ -118,14 +118,34 @@ pub fn set_raw(fd: i32) -> io::Result<Guard> {
         Ok(Guard { fd, original })
     }
 }
-pub fn winsize(fd: i32) -> (u16, u16) {
+pub fn winsize(fd: i32) -> portable_pty::PtySize {
     unsafe {
         // SAFETY: ioctl writes to a correctly sized winsize value.
         let mut size: libc::winsize = std::mem::zeroed();
         if libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) == 0 {
-            (size.ws_row.max(1), size.ws_col.max(1))
+            portable_pty::PtySize {
+                rows: size.ws_row.max(1),
+                cols: size.ws_col.max(1),
+                pixel_width: size.ws_xpixel,
+                pixel_height: size.ws_ypixel,
+            }
         } else {
-            (24, 80)
+            portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            }
+        }
+    }
+}
+pub fn forward_signal(pgid: Pid, signal: i32) -> io::Result<()> {
+    unsafe {
+        // SAFETY: kill validates the process-group id and signal number.
+        if libc::kill(-pgid, signal) == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 }
