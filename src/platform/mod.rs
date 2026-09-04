@@ -16,6 +16,8 @@ pub struct Job {
     pub processes: Vec<Process>,
 }
 
+pub mod probe;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]

@@ -18,7 +18,7 @@ use crate::{
 };
 
 pub struct Options {
-    pub rule_set: Option<RuleSet>,
+    pub rule_sets: Vec<RuleSet>,
     pub agent: Option<crate::osc::AgentId>,
     pub no_osc: bool,
     pub title: TitleMode,
@@ -97,6 +97,9 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     let mut queued = Vec::<Vec<u8>>::new();
     let mut stdout = io::stdout().lock();
     let child_pid = child.process_id().and_then(|pid| i32::try_from(pid).ok());
+    let mut active_agent = options.agent.clone();
+    let mut scheduler = crate::platform::probe::Scheduler::new(std::time::Instant::now());
+    let mut last_pgid = None;
     loop {
         let message = output_rx.recv_timeout(std::time::Duration::from_millis(50));
         let chunk = match message {
@@ -122,7 +125,10 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
             stdout.flush().context("flush child output")?;
             let _ = screen.process(&chunk);
             if screen.changed() {
-                let verdict = options.rule_set.as_ref().map(|set| evaluate(set, &screen));
+                let verdict = active_agent
+                    .as_ref()
+                    .and_then(|id| options.rule_sets.iter().find(|set| set.id == id.as_str()))
+                    .map(|set| evaluate(set, &screen));
                 if options.debug
                     && let Some(value) = &verdict
                 {
@@ -130,7 +136,7 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                 }
                 let events = machine.observe(
                     verdict,
-                    options.agent.clone(),
+                    active_agent.clone(),
                     child_pid,
                     false,
                     std::time::Instant::now(),
@@ -146,7 +152,45 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                 screen.clear_changed();
             }
         }
-        let timer_events = machine.tick(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        if options.agent.is_none()
+            && scheduler.due(now)
+            && let Some(pid) = child_pid
+        {
+            let pgid = crate::platform::foreground_pgid(pid);
+            let changed = pgid != last_pgid;
+            last_pgid = pgid;
+            let full = scheduler.completed(
+                now,
+                active_agent.is_some(),
+                machine.next_deadline().is_some(),
+                changed,
+            );
+            if full {
+                let detected = pgid.and_then(|group| {
+                    let direct =
+                        crate::platform::leader(group).map(|process| crate::platform::Job {
+                            leader: group,
+                            processes: vec![process],
+                        });
+                    let listed = direct.unwrap_or_else(|| crate::platform::job(pid, group));
+                    crate::rules::ident::identify(&listed, &options.rule_sets).map(|(id, _)| id)
+                });
+                if detected != active_agent {
+                    active_agent = detected;
+                    let events = machine.observe(None, active_agent.clone(), child_pid, false, now);
+                    queue_events(
+                        &events,
+                        &options,
+                        &screen,
+                        &mut titles,
+                        &mut sink,
+                        &mut queued,
+                    );
+                }
+            }
+        }
+        let timer_events = machine.tick(now);
         queue_events(
             &timer_events,
             &options,
