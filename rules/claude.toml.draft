@@ -1,0 +1,15 @@
+# Draft only: no genuine Claude Code panes were available during implementation.
+# This file is deliberately excluded from the bundled rule sets.
+id = "claude"
+aliases = ["claude-code"]
+process_names = ["claude"]
+prompt_marker = ">"
+block_markers = ["Allow", "Do you want to proceed?"]
+
+[[rules]]
+id = "draft_working_progress"
+state = "working"
+priority = 10
+region = "progress"
+regex = ["^3:"]
+visible_working = true

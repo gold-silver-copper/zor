@@ -11,4 +11,9 @@ vt100 0.16.2 on 2026-09-03.
   therefore use its separately specified streaming ECMA-48 boundary tracker.
 - Shared wire types live in `osc`. The CLI-only hysteresis state may import them, but `osc` must
   never depend on wrapper modules.
-
+- The wrapper constructs vt100 with a fixed 65,535-line history budget. vt100 can resize the
+  viewport but cannot grow its configured history after construction.
+- Output has one owner in the main loop. The PTY reader sends chunks over a channel; the loop
+  flushes each chunk before parsing it and before any future injected bytes.
+- No genuine Claude Code panes were available. `rules/claude.toml.draft` is intentionally not
+  registered as a bundle and `zor agents` reports that there are no bundled sets.
