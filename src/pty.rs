@@ -10,6 +10,27 @@ use std::{
     thread,
 };
 
+const OUTPUT_QUEUE_DEPTH: usize = 8;
+const MAX_QUEUED_INJECTIONS: usize = 128;
+const MAX_QUEUED_INJECTION_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_PTY_ROWS: u16 = 512;
+pub(crate) const MAX_PTY_COLS: u16 = 512;
+
+fn clamp_size(mut size: portable_pty::PtySize) -> portable_pty::PtySize {
+    size.rows = size.rows.clamp(1, MAX_PTY_ROWS);
+    size.cols = size.cols.clamp(1, MAX_PTY_COLS);
+    size
+}
+
+fn queue_injection(queued: &mut Vec<Vec<u8>>, bytes: Vec<u8>) {
+    let current = queued.iter().map(Vec::len).sum::<usize>();
+    if queued.len() < MAX_QUEUED_INJECTIONS
+        && current.saturating_add(bytes.len()) <= MAX_QUEUED_INJECTION_BYTES
+    {
+        queued.push(bytes);
+    }
+}
+
 use crate::{
     emit::{
         events::{AgentLine, EventLine, ExitLine, Sink, encode, timestamp},
@@ -76,7 +97,7 @@ pub struct Options {
 
 pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     let system = NativePtySystem::default();
-    let initial_size = crate::platform::winsize(0);
+    let initial_size = clamp_size(crate::platform::winsize(0));
     let mut raw_guard = crate::platform::set_raw(0).ok();
     let pair = system.openpty(initial_size).context("open pty")?;
     let mut builder = CommandBuilder::new(command);
@@ -109,8 +130,10 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
         Eof,
         Signal(i32),
     }
-    let (output_tx, output_rx) = mpsc::channel::<Message>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (output_tx, output_rx) = mpsc::sync_channel::<Message>(OUTPUT_QUEUE_DEPTH);
     let reader_tx = output_tx.clone();
+    let reader_cancel = Arc::clone(&cancel);
     let reader_thread = thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -120,15 +143,36 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                     let Some(chunk) = buffer.get(..count) else {
                         break;
                     };
-                    if reader_tx.send(Message::Chunk(chunk.to_vec())).is_err() {
-                        break;
+                    let mut message = Message::Chunk(chunk.to_vec());
+                    loop {
+                        match reader_tx.try_send(message) {
+                            Ok(()) => break,
+                            Err(mpsc::TrySendError::Full(returned))
+                                if !reader_cancel.load(Ordering::Relaxed) =>
+                            {
+                                message = returned;
+                                thread::park_timeout(std::time::Duration::from_millis(5));
+                            }
+                            Err(_) => return,
+                        }
                     }
                 }
             }
         }
-        let _ = reader_tx.send(Message::Eof);
+        let mut eof = Message::Eof;
+        loop {
+            match reader_tx.try_send(eof) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(returned))
+                    if !reader_cancel.load(Ordering::Relaxed) =>
+                {
+                    eof = returned;
+                    thread::park_timeout(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
     });
-    let cancel = Arc::new(AtomicBool::new(false));
     let writer_cancel = Arc::clone(&cancel);
     let writer_thread = thread::spawn(move || {
         let stdin = io::stdin();
@@ -186,8 +230,9 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     let signal_handle = signals.handle();
     let signal_thread = thread::spawn(move || {
         for signal in signals.forever() {
-            if signal_tx.send(Message::Signal(signal)).is_err() {
-                break;
+            match signal_tx.try_send(Message::Signal(signal)) {
+                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                Err(mpsc::TrySendError::Disconnected(_)) => break,
             }
         }
     });
@@ -240,7 +285,7 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
             Ok(Message::Eof) => break,
             Ok(Message::Signal(signal)) => {
                 if signal == signal_hook::consts::SIGWINCH {
-                    let size = crate::platform::winsize(0);
+                    let size = clamp_size(crate::platform::winsize(0));
                     restore_on_error(
                         pair.master.resize(size).context("resize pty"),
                         &titles,
@@ -314,7 +359,7 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                     state,
                     active_agent.as_ref().map(crate::osc::AgentId::as_str),
                 ) {
-                    queued.push(bytes);
+                    queue_injection(&mut queued, bytes);
                 }
             }
             if screen.changed() {
@@ -610,14 +655,14 @@ fn queue_events(
         };
         if let Ok(report) = Report::new(*state, agent.clone(), *seq, *visible, *exited, None) {
             if !options.no_osc {
-                queued.push(crate::osc::format(&report));
+                queue_injection(queued, crate::osc::format(&report));
             }
             if let Some(title) = titles.observe(
                 screen.title(),
                 *state,
                 agent.as_ref().map(crate::osc::AgentId::as_str),
             ) {
-                queued.push(title);
+                queue_injection(queued, title);
             }
         }
         if let Some(target) = sink {
@@ -726,7 +771,9 @@ pub fn run_transparent(command: &str, argv: &[String]) -> Result<u8> {
 
 #[cfg(test)]
 mod signal_tests {
-    use super::forward_signal_with_retry;
+    use super::{
+        MAX_PTY_COLS, MAX_PTY_ROWS, clamp_size, forward_signal_with_retry, queue_injection,
+    };
 
     #[test]
     fn failed_cached_group_retries_current_then_child_fallback() {
@@ -748,5 +795,30 @@ mod signal_tests {
         });
         assert!(result.is_ok());
         assert_eq!(attempts, [42]);
+    }
+
+    #[test]
+    fn geometry_and_deferred_injections_are_bounded() {
+        let size = clamp_size(portable_pty::PtySize {
+            rows: u16::MAX,
+            cols: u16::MAX,
+            pixel_width: u16::MAX,
+            pixel_height: u16::MAX,
+        });
+        assert_eq!((size.rows, size.cols), (MAX_PTY_ROWS, MAX_PTY_COLS));
+        assert_eq!((size.pixel_width, size.pixel_height), (u16::MAX, u16::MAX));
+
+        let mut queued = Vec::new();
+        for _ in 0..10_000 {
+            queue_injection(&mut queued, vec![b'x'; 1_024]);
+        }
+        assert!(queued.len() <= super::MAX_QUEUED_INJECTIONS);
+        assert!(queued.iter().map(Vec::len).sum::<usize>() <= super::MAX_QUEUED_INJECTION_BYTES);
+        let before = queued.len();
+        queue_injection(
+            &mut queued,
+            vec![b'x'; super::MAX_QUEUED_INJECTION_BYTES + 1],
+        );
+        assert_eq!(queued.len(), before);
     }
 }

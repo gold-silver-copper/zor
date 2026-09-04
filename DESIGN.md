@@ -62,7 +62,7 @@ reach the child unchanged.
 
 ## Architecture
 
-```
+```text
   stdin ──▶ [pty master] ──▶ child (shell or agent)
                 │
                 └── child output ──┬──▶ stdout (byte-identical, plus state OSCs)
@@ -266,7 +266,7 @@ since there is no other way to arrive at them than the same months.
 
 ### In-band: the state OSC
 
-```
+```text
 ESC ] 7877 ; state=<working|blocked|idle|none> ; agent=<id> ; seq=<n> ST
 ```
 
