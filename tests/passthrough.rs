@@ -98,7 +98,7 @@ fn terminal_response_reaches_child_stdin() -> Result<(), Box<dyn std::error::Err
             "--",
             "/bin/sh",
             "-c",
-            "stty -echo; printf '\\x1b[c'; IFS= read -r reply; printf %s \"$reply\"",
+            "stty -echo; printf '\\033[c'; IFS= read -r reply; printf %s \"$reply\"",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -131,7 +131,7 @@ fn split_control_string_is_never_interleaved() -> Result<(), Box<dyn std::error:
             "--",
             "/bin/sh",
             "-c",
-            "printf '\\x1bPfirst'; sleep 0.05; printf 'second\\x1b\\\\'",
+            "printf '\\033Pfirst'; sleep 0.05; printf 'second\\033\\\\'",
         ])
         .output()?;
     assert_eq!(output.stdout, b"\x1bPfirstsecond\x1b\\");
