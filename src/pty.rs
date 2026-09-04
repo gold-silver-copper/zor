@@ -301,11 +301,11 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                 if let Some(current) = current {
                     signal_foreground.store(current, Ordering::Release);
                 }
-                let _ = forward_signal_with_retry(
+                let _ = forward_termination_with_escalation(
                     current,
-                    None,
                     child_pid.or(child_pgid),
                     signal,
+                    || thread::park_timeout(std::time::Duration::from_millis(100)),
                     crate::platform::forward_signal,
                 );
                 continue;
@@ -654,6 +654,28 @@ fn forward_signal_with_retry(
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no live child process group")))
 }
 
+fn forward_termination_with_escalation(
+    current_pgid: Option<i32>,
+    child_pgid: Option<i32>,
+    signal: i32,
+    pause: impl FnOnce(),
+    mut forward: impl FnMut(i32, i32) -> io::Result<()>,
+) -> io::Result<()> {
+    let initial = forward_signal_with_retry(current_pgid, None, child_pgid, signal, &mut forward);
+    pause();
+    let forced = forward_signal_with_retry(
+        current_pgid,
+        None,
+        child_pgid,
+        signal_hook::consts::SIGKILL,
+        &mut forward,
+    );
+    match (initial, forced) {
+        (Ok(()), _) | (_, Ok(())) => Ok(()),
+        (Err(initial), Err(_)) => Err(initial),
+    }
+}
+
 fn restore_on_error<T>(result: Result<T>, titles: &Titles, stdout: &mut impl Write) -> Result<T> {
     if result.is_err()
         && let Some(bytes) = titles.restore()
@@ -880,8 +902,9 @@ pub fn run_transparent(command: &str, argv: &[String]) -> Result<u8> {
 #[allow(clippy::expect_used)]
 mod signal_tests {
     use super::{
-        MAX_PTY_COLS, MAX_PTY_ROWS, clamp_size, forward_signal_with_retry, queue_injection,
-        take_pending_signal, write_private_fixture,
+        MAX_PTY_COLS, MAX_PTY_ROWS, clamp_size, forward_signal_with_retry,
+        forward_termination_with_escalation, queue_injection, take_pending_signal,
+        write_private_fixture,
     };
 
     #[test]
@@ -904,6 +927,31 @@ mod signal_tests {
         });
         assert!(result.is_ok());
         assert_eq!(attempts, [42]);
+    }
+
+    #[test]
+    fn wrapper_termination_escalates_the_owned_inner_group_before_reaping() {
+        let mut attempts = Vec::new();
+        let mut paused = false;
+        forward_termination_with_escalation(
+            Some(42),
+            Some(7),
+            signal_hook::consts::SIGHUP,
+            || paused = true,
+            |pgid, signal| {
+                attempts.push((pgid, signal));
+                Ok(())
+            },
+        )
+        .expect("termination forwarding");
+        assert!(paused);
+        assert_eq!(
+            attempts,
+            [
+                (42, signal_hook::consts::SIGHUP),
+                (42, signal_hook::consts::SIGKILL)
+            ]
+        );
     }
 
     #[test]
