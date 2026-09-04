@@ -9,6 +9,7 @@ description = "Portable agent-state wrapper and OSC 7877 protocol"
 [features]
 default = ["cli"]
 cli = [
+    "dep:anyhow",
     "dep:clap",
     "dep:libc",
     "dep:portable-pty",
@@ -21,6 +22,8 @@ cli = [
 ]
 
 [dependencies]
+# Context-rich wrapper runtime errors.
+anyhow = { version = "1.0", optional = true }
 # Command-line parsing for the feature-gated wrapper binary.
 clap = { version = "4.5", features = ["derive"], optional = true }
 # Unix terminal and process primitives used only by platform adapters.
