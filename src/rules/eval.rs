@@ -119,6 +119,12 @@ fn region_text(region: Region, set: &RuleSet, view: &impl ScreenView) -> String 
                 }
             }
         }
+        Region::AfterLastRule => lines
+            .iter()
+            .rposition(|line| horizontal_rule(line))
+            .map_or_else(String::new, |index| {
+                join(lines.get(index.saturating_add(1)..).unwrap_or_default())
+            }),
         Region::AfterLastPromptMarker => marker_index(&lines, set.prompt_marker.as_deref())
             .map_or_else(String::new, |index| {
                 join(lines.get(index.saturating_add(1)..).unwrap_or_default())
@@ -166,4 +172,98 @@ fn horizontal_rule(line: &str) -> bool {
     let value = line.trim();
     let count = value.chars().take_while(|ch| *ch == '─').count();
     count >= 3 || (count == 2 && value.chars().count() == 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::{load, view::Progress};
+    use std::{borrow::Cow, path::Path};
+
+    struct View {
+        lines: Vec<String>,
+        text: String,
+    }
+    impl View {
+        fn new(value: &str) -> Self {
+            Self {
+                lines: value.lines().map(str::to_owned).collect(),
+                text: value.to_owned(),
+            }
+        }
+    }
+    impl ScreenView for View {
+        fn lines(&self) -> impl Iterator<Item = Cow<'_, str>> {
+            self.lines.iter().map(|line| Cow::Borrowed(line.as_str()))
+        }
+        fn text(&self) -> &str {
+            &self.text
+        }
+        fn title(&self) -> &str {
+            "Title"
+        }
+        fn progress(&self) -> Option<Progress> {
+            Some(Progress {
+                state: 3,
+                percent: 0,
+            })
+        }
+        fn size(&self) -> (u16, u16) {
+            (10, 20)
+        }
+    }
+    #[allow(clippy::panic)]
+    fn set() -> RuleSet {
+        load(
+            Path::new("test.toml"),
+            r#"id = "test"
+prompt_marker = "❯"
+block_markers = ["blocked"]
+[[rules]]
+id = "guarded"
+state = "blocked"
+priority = 2
+region = "whole"
+contains = ["READY"]
+regex = ["(?m)^ready"]
+line_regex = ["done$"]
+[[rules.not]]
+contains = ["cancel"]
+[[rules]]
+id = "lower"
+state = "working"
+priority = 1
+region = "whole"
+contains = ["ready"]
+"#,
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[test]
+    fn gates_conjoin_and_priority_is_stable() {
+        // Phase Z §2: gate parts conjoin and the highest-priority match wins.
+        assert_eq!(
+            evaluate(&set(), &View::new("ready\ndone\n"))
+                .rule
+                .as_deref(),
+            Some("guarded")
+        );
+        assert_eq!(
+            evaluate(&set(), &View::new("ready cancel\ndone\n"))
+                .rule
+                .as_deref(),
+            Some("lower")
+        );
+    }
+    #[test]
+    fn region_contract_handles_rules_blanks_and_prompts() {
+        // Phase Z §2: region boundaries retain internal blanks and distinguish box rules.
+        let view = View::new("old\n───\ninside\n\n──\nafter\n");
+        let set = set();
+        assert_eq!(region_text(Region::PromptBox, &set, &view), "inside\n\n");
+        assert_eq!(region_text(Region::AfterLastRule, &set, &view), "after\n");
+        assert!(!horizontal_rule("---"));
+        assert!(horizontal_rule("──"));
+    }
 }

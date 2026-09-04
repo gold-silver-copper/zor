@@ -60,14 +60,64 @@ fn process(pid: Pid) -> Option<Process> {
     }
     .to_string_lossy()
     .into_owned();
+    let (argv0, argv, env_agent) =
+        arguments(pid).unwrap_or_else(|| (Some(comm.clone()), vec![comm.clone()], None));
     Some(Process {
         pid,
         ppid: value.pbi_ppid as Pid,
         comm: comm.clone(),
-        argv0: Some(comm.clone()),
-        argv: vec![comm],
-        env_agent: None,
+        argv0,
+        argv,
+        env_agent,
     })
+}
+
+fn arguments(pid: Pid) -> Option<(Option<String>, Vec<String>, Option<String>)> {
+    unsafe {
+        // SAFETY: sysctl is first queried for size, then writes only into that allocated byte buffer.
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut size = 0usize;
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+            || size < 4
+        {
+            return None;
+        }
+        let mut bytes = vec![0u8; size];
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return None;
+        }
+        bytes.truncate(size);
+        let argc = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+        let mut fields = bytes
+            .get(4..)?
+            .split(|byte| *byte == 0)
+            .filter(|field| !field.is_empty());
+        let _executable = fields.next()?;
+        let mut argv = Vec::new();
+        for _ in 0..argc.max(0) {
+            argv.push(String::from_utf8_lossy(fields.next()?).into_owned());
+        }
+        let argv0 = argv.first().cloned();
+        let env_agent = fields
+            .find_map(|field| field.strip_prefix(b"ZOR_AGENT="))
+            .map(|value| String::from_utf8_lossy(value).into_owned());
+        Some((argv0, argv, env_agent))
+    }
 }
 pub struct Guard {
     fd: i32,

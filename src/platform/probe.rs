@@ -5,6 +5,7 @@ pub struct Scheduler {
     last_full: Option<Instant>,
     acquisition: Option<Instant>,
 }
+
 impl Scheduler {
     #[must_use]
     pub fn new(now: Instant) -> Self {
@@ -57,5 +58,23 @@ impl Scheduler {
         };
         self.next = now + cadence;
         full
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn scheduler_uses_acquisition_and_identified_cadences() {
+        // Phase Z §4: acquisition starts fast and identified probes use 300 ms ticks.
+        let now = Instant::now();
+        let mut scheduler = Scheduler::new(now);
+        assert!(scheduler.due(now));
+        assert!(scheduler.completed(now, false, false, true));
+        assert!(!scheduler.due(now + Duration::from_millis(499)));
+        assert!(scheduler.due(now + Duration::from_millis(500)));
+        let later = now + Duration::from_secs(1);
+        let _ = scheduler.completed(later, true, false, false);
+        assert!(scheduler.due(later + Duration::from_millis(300)));
     }
 }

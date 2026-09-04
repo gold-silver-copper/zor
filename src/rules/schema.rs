@@ -11,6 +11,7 @@ pub enum Region {
     BottomNonEmpty(usize),
     TopNonEmpty(usize),
     PromptBox,
+    AfterLastRule,
     AfterLastPromptMarker,
     WholeUnlessAtPrompt,
     Title,
@@ -30,6 +31,7 @@ impl FromStr for Region {
         let simple = match value {
             "whole" => Some(Self::Whole),
             "prompt_box" => Some(Self::PromptBox),
+            "after_last_rule" => Some(Self::AfterLastRule),
             "after_last_prompt_marker" => Some(Self::AfterLastPromptMarker),
             "whole_unless_at_prompt" => Some(Self::WholeUnlessAtPrompt),
             "title" => Some(Self::Title),

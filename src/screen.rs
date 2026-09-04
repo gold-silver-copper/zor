@@ -212,20 +212,36 @@ impl Screen {
     fn refresh_window(&mut self) {
         let mut snapshot = self.parser.screen().clone();
         let alternate = snapshot.alternate_screen();
-        if !alternate {
-            snapshot.set_scrollback(self.rows as usize);
-        }
-        let contents = snapshot.contents();
-        let mut lines: Vec<String> = contents
-            .lines()
+        let live: Vec<String> = snapshot
+            .rows(0, self.cols)
             .map(|line| line.trim_end().to_owned())
             .collect();
+        let mut lines = if alternate {
+            live
+        } else {
+            let cursor = usize::from(snapshot.cursor_position().0);
+            let last_non_blank = live.iter().rposition(|line| !line.is_empty());
+            let live_end = last_non_blank.map_or_else(
+                || usize::from(self.rows.saturating_sub(1)),
+                |row| row.max(cursor),
+            );
+            snapshot.set_scrollback(usize::from(self.rows));
+            let history_count = snapshot.scrollback();
+            let mut combined: Vec<String> = snapshot
+                .rows(0, self.cols)
+                .take(history_count)
+                .map(|line| line.trim_end().to_owned())
+                .collect();
+            combined.extend(live);
+            let end = history_count
+                .saturating_add(live_end)
+                .saturating_add(1)
+                .min(combined.len());
+            let start = end.saturating_sub(usize::from(self.rows));
+            combined.get(start..end).unwrap_or_default().to_vec()
+        };
         while lines.last().is_some_and(String::is_empty) {
             lines.pop();
-        }
-        let keep = usize::from(self.rows);
-        if lines.len() > keep {
-            lines.drain(..lines.len().saturating_sub(keep));
         }
         self.text = lines.join("\n");
         if !self.text.is_empty() {
