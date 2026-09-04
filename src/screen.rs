@@ -162,7 +162,7 @@ impl BoundaryTracker {
     /// Returns the byte the VT parser may consume. The first over-limit byte is replaced by CAN,
     /// resetting the parser without retaining the accumulated string; subsequent bytes through
     /// the real terminator are observed only by this constant-space boundary state machine.
-    fn parser_byte(&mut self, byte: u8) -> Option<u8> {
+    fn parser_byte(&mut self, byte: u8) -> (Option<u8>, bool) {
         let was_discarding = matches!(
             self.state,
             Sequence::String {
@@ -172,7 +172,7 @@ impl BoundaryTracker {
         );
         self.byte(byte);
         if was_discarding {
-            return None;
+            return (None, false);
         }
         if matches!(
             self.state,
@@ -181,9 +181,9 @@ impl BoundaryTracker {
                 ..
             }
         ) {
-            Some(0x18)
+            (Some(0x18), true)
         } else {
-            Some(byte)
+            (Some(byte), false)
         }
     }
 
@@ -242,8 +242,9 @@ impl Screen {
         let mut filtered = Vec::with_capacity(bytes.len().min(8192));
         let mut discarded_control = false;
         for &byte in bytes {
-            if let Some(byte) = self.boundary.parser_byte(byte) {
-                discarded_control |= byte == 0x18;
+            let (parser_byte, injected_reset) = self.boundary.parser_byte(byte);
+            discarded_control |= injected_reset;
+            if let Some(byte) = parser_byte {
                 filtered.push(byte);
                 if filtered.len() == 8192 {
                     self.parser.process(&filtered);
@@ -431,6 +432,14 @@ mod tests {
             screen.process(chunk);
         }
         assert_eq!(screen.take_observed_reports().len(), 1);
+        assert!(screen.ground());
+    }
+
+    #[test]
+    fn genuine_can_after_completed_osc_does_not_rollback_callbacks() {
+        let mut screen = Screen::new(4, 20);
+        screen.process(b"\x1b]2;kept\x07\x18");
+        assert_eq!(screen.title(), "kept");
         assert!(screen.ground());
     }
 
