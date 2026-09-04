@@ -1,5 +1,5 @@
 #![doc = include_str!("../DESIGN.md")]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod osc;
 

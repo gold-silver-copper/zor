@@ -1,3 +1,4 @@
+pub mod bundle;
 pub mod eval;
 pub mod ident;
 pub mod schema;

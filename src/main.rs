@@ -37,9 +37,35 @@ fn run(cli: cli::Cli) -> anyhow::Result<u8> {
     } else {
         cli.command.into_iter().skip(1).collect()
     };
+    let sets = zor::rules::bundle::load_all(&cli.rules)?;
+    let agent = cli
+        .agent
+        .as_deref()
+        .map(zor::osc::AgentId::new)
+        .transpose()?;
+    let rule_set = agent
+        .as_ref()
+        .and_then(|id| sets.iter().find(|set| set.id == id.as_str()))
+        .cloned();
+    let title = match cli.title {
+        cli::TitleMode::Never => zor::emit::title::Mode::Never,
+        cli::TitleMode::Prefix => zor::emit::title::Mode::Prefix,
+        cli::TitleMode::Replace => zor::emit::title::Mode::Replace,
+    };
     if std::env::var_os("ZOR_PID").is_some() {
         zor::pty::run_transparent(&command, &argv)
     } else {
-        zor::pty::run(&command, &argv)
+        zor::pty::run(
+            &command,
+            &argv,
+            zor::pty::Options {
+                rule_set,
+                agent,
+                no_osc: cli.no_osc,
+                title,
+                events: cli.events,
+                debug: cli.debug,
+            },
+        )
     }
 }

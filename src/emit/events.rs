@@ -1,5 +1,14 @@
 use serde::Serialize;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    os::unix::{
+        fs::{FileTypeExt, OpenOptionsExt},
+        net::UnixStream,
+    },
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Serialize)]
 pub struct EventLine<'a> {
@@ -37,6 +46,80 @@ pub fn timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}.{:03}", duration.as_secs(), duration.subsec_millis())
+}
+
+enum Target {
+    Socket(UnixStream),
+    File(File),
+}
+pub struct Sink {
+    path: PathBuf,
+    target: Option<Target>,
+    retry_at: Instant,
+    pub dropped: u64,
+}
+impl Sink {
+    pub fn connect(path: impl Into<PathBuf>) -> Self {
+        let mut value = Self {
+            path: path.into(),
+            target: None,
+            retry_at: Instant::now(),
+            dropped: 0,
+        };
+        value.reconnect();
+        value
+    }
+    pub fn write(&mut self, line: &[u8]) {
+        if self.target.is_none() && Instant::now() >= self.retry_at {
+            self.reconnect();
+        }
+        let result = match self.target.as_mut() {
+            Some(Target::Socket(value)) => value.write_all(line),
+            Some(Target::File(value)) => value.write_all(line),
+            None => return,
+        };
+        if let Err(error) = result {
+            self.dropped = self.dropped.saturating_add(1);
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
+            ) {
+                self.target = None;
+                self.retry_at = Instant::now() + Duration::from_secs(1);
+            }
+        }
+    }
+    fn reconnect(&mut self) {
+        self.target = open_target(&self.path).ok();
+        if self.target.is_none() {
+            self.retry_at = Instant::now() + Duration::from_secs(1);
+        }
+    }
+}
+fn open_target(path: &Path) -> io::Result<Target> {
+    if path == Path::new("-") {
+        return OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open("/dev/fd/3")
+            .map(Target::File);
+    }
+    if let Ok(socket) = UnixStream::connect(path) {
+        socket.set_nonblocking(true)?;
+        return Ok(Target::Socket(socket));
+    }
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.file_type().is_fifo() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "event path is not a unix socket or fifo",
+        ));
+    }
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map(Target::File)
 }
 
 #[cfg(test)]

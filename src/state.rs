@@ -97,6 +97,7 @@ impl Machine {
                 });
             } else if self.agent.is_some() {
                 events.push(Event::AgentLost);
+                events.push(self.publish(State::None, Flags::default(), false, now));
             }
             self.agent = agent.clone();
         }
@@ -192,5 +193,168 @@ impl Machine {
             visible,
             exited,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::schema::Region;
+
+    fn verdict(state: RuleState, visible: Flags) -> Verdict {
+        Verdict {
+            state,
+            visible,
+            rule: None,
+            region: Region::Whole,
+        }
+    }
+    fn agent() -> Option<AgentId> {
+        AgentId::new("test").ok()
+    }
+
+    #[test]
+    fn plain_idle_publishes_on_the_fourth_verdict() {
+        // Phase Z §3: working-to-plain-idle requires three confirmations after opening.
+        let start = Instant::now();
+        let mut machine = Machine::new(Config {
+            startup_grace: Duration::ZERO,
+            ..Config::default()
+        });
+        let _ = machine.observe(
+            Some(verdict(RuleState::Working, Flags::default())),
+            agent(),
+            Some(1),
+            false,
+            start,
+        );
+        for offset in 1..4 {
+            assert!(
+                machine
+                    .observe(
+                        Some(verdict(RuleState::Idle, Flags::default())),
+                        agent(),
+                        Some(1),
+                        false,
+                        start + Duration::from_millis(offset)
+                    )
+                    .is_empty()
+            );
+        }
+        assert!(matches!(
+            machine
+                .observe(
+                    Some(verdict(RuleState::Idle, Flags::default())),
+                    agent(),
+                    Some(1),
+                    false,
+                    start + Duration::from_millis(4)
+                )
+                .as_slice(),
+            [Event::Changed {
+                state: State::Idle,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn hold_cap_and_visible_idle_publish() {
+        // Phase Z §3: the cap forces idle while visible idle bypasses holding.
+        let start = Instant::now();
+        let mut machine = Machine::new(Config {
+            startup_grace: Duration::ZERO,
+            ..Config::default()
+        });
+        let _ = machine.observe(
+            Some(verdict(RuleState::Working, Flags::default())),
+            agent(),
+            Some(1),
+            false,
+            start,
+        );
+        let _ = machine.observe(
+            Some(verdict(RuleState::Idle, Flags::default())),
+            agent(),
+            Some(1),
+            false,
+            start,
+        );
+        assert!(matches!(
+            machine.tick(start + Duration::from_millis(700)).as_slice(),
+            [Event::Changed {
+                state: State::Idle,
+                ..
+            }]
+        ));
+        let _ = machine.observe(
+            Some(verdict(RuleState::Working, Flags::default())),
+            agent(),
+            Some(1),
+            false,
+            start + Duration::from_secs(1),
+        );
+        assert!(matches!(
+            machine
+                .observe(
+                    Some(verdict(
+                        RuleState::Idle,
+                        Flags {
+                            idle: true,
+                            ..Flags::default()
+                        }
+                    )),
+                    agent(),
+                    Some(1),
+                    false,
+                    start + Duration::from_secs(1)
+                )
+                .as_slice(),
+            [Event::Changed {
+                state: State::Idle,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn heartbeat_keeps_sequence_and_loss_publishes_none() {
+        // Phase Z §3: heartbeats do not advance seq and agent loss clears state.
+        let start = Instant::now();
+        let mut machine = Machine::new(Config {
+            startup_grace: Duration::ZERO,
+            ..Config::default()
+        });
+        let events = machine.observe(
+            Some(verdict(
+                RuleState::Blocked,
+                Flags {
+                    blocker: true,
+                    ..Flags::default()
+                },
+            )),
+            agent(),
+            Some(2),
+            false,
+            start,
+        );
+        let seq = match events.last() {
+            Some(Event::Changed { seq, .. }) => *seq,
+            _ => 0,
+        };
+        assert!(
+            matches!(machine.tick(start + Duration::from_millis(800)).as_slice(), [Event::Heartbeat { seq: value, .. }] if *value == seq)
+        );
+        let lost = machine.observe(None, None, None, false, start + Duration::from_secs(1));
+        assert!(matches!(
+            lost.as_slice(),
+            [
+                Event::AgentLost,
+                Event::Changed {
+                    state: State::None,
+                    ..
+                }
+            ]
+        ));
     }
 }
