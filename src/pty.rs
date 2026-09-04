@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Write},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -29,6 +29,15 @@ fn queue_injection(queued: &mut Vec<Vec<u8>>, bytes: Vec<u8>) {
     {
         queued.push(bytes);
     }
+}
+
+fn take_pending_signal(pending: &AtomicU64) -> Option<i32> {
+    let bits = pending.load(Ordering::Acquire);
+    let index = bits.trailing_zeros();
+    (index < u64::BITS).then(|| {
+        pending.fetch_and(!(1_u64 << index), Ordering::AcqRel);
+        i32::try_from(index).unwrap_or_default()
+    })
 }
 
 use crate::{
@@ -206,7 +215,9 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
         }
     });
 
-    let signal_tx = output_tx;
+    // Signals use an independent coalescing bitset: PTY output backpressure can neither block nor
+    // consume a termination request, while a signal storm cannot grow memory.
+    let pending_signals = Arc::new(AtomicU64::new(0));
     let signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGWINCH,
         signal_hook::consts::SIGINT,
@@ -228,11 +239,13 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
         }
     };
     let signal_handle = signals.handle();
+    let signal_pending = Arc::clone(&pending_signals);
     let signal_thread = thread::spawn(move || {
         for signal in signals.forever() {
-            match signal_tx.try_send(Message::Signal(signal)) {
-                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                Err(mpsc::TrySendError::Disconnected(_)) => break,
+            if let Ok(index) = u32::try_from(signal)
+                && index < u64::BITS
+            {
+                signal_pending.fetch_or(1_u64 << index, Ordering::Release);
             }
         }
     });
@@ -279,7 +292,10 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     let mut loss_tracker = crate::platform::probe::LossTracker::new();
     let mut last_title = String::new();
     loop {
-        let message = output_rx.recv_timeout(std::time::Duration::from_millis(50));
+        let message = take_pending_signal(&pending_signals).map_or_else(
+            || output_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            |signal| Ok(Message::Signal(signal)),
+        );
         let chunk = match message {
             Ok(Message::Chunk(chunk)) => Some(chunk),
             Ok(Message::Eof) => break,
@@ -596,10 +612,20 @@ fn write_fixture(screen: &Screen, agent: Option<&crate::osc::AgentId>) {
         screen.title(),
         screen.text()
     );
-    match std::fs::write(&path, body) {
+    match write_private_fixture(&path, body.as_bytes()) {
         Ok(()) => eprintln!("zor: fixture written to {}", path.display()),
         Err(error) => eprintln!("zor: failed to write fixture: {error}"),
     }
+}
+
+fn write_private_fixture(path: &std::path::Path, body: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(body)
 }
 
 fn queue_events(
@@ -770,9 +796,11 @@ pub fn run_transparent(command: &str, argv: &[String]) -> Result<u8> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod signal_tests {
     use super::{
         MAX_PTY_COLS, MAX_PTY_ROWS, clamp_size, forward_signal_with_retry, queue_injection,
+        take_pending_signal, write_private_fixture,
     };
 
     #[test]
@@ -820,5 +848,32 @@ mod signal_tests {
             vec![b'x'; super::MAX_QUEUED_INJECTION_BYTES + 1],
         );
         assert_eq!(queued.len(), before);
+    }
+
+    #[test]
+    fn signals_are_independent_of_full_output_and_fixtures_are_private_create_new() {
+        let (output_tx, _output_rx) = std::sync::mpsc::sync_channel(1);
+        output_tx.send(1_u8).expect("fill output");
+        let signals = std::sync::atomic::AtomicU64::new(0);
+        signals.fetch_or(1 << 15, std::sync::atomic::Ordering::Release);
+        assert_eq!(take_pending_signal(&signals), Some(15));
+        assert_eq!(take_pending_signal(&signals), None);
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let path =
+            std::env::temp_dir().join(format!("zor-private-fixture-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        write_private_fixture(&path, b"secret").expect("create fixture");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(write_private_fixture(&path, b"overwrite").is_err());
+        assert_eq!(std::fs::read(&path).expect("read"), b"secret");
+        std::fs::remove_file(path).expect("cleanup");
     }
 }

@@ -25,6 +25,9 @@ zor check <fixture.txt> [--agent id]
 zor agents
 ```
 
+External input is bounded: zor loads at most 256 rule files, each at most 1 MiB, and accepts
+fixtures up to 4 MiB. SIGUSR1 captures are created atomically with owner-only permissions.
+
 Everything else passes through untouched. Child output reaches stdout byte-for-byte before zor
 appends its own OSCs; stdin, window size (including pixels), signals, and exit status propagate to
 the child. zor does not set `TERM`, answer terminal queries, or implement keyboard protocols.

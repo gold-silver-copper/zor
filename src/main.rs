@@ -69,7 +69,8 @@ fn check_fixture(
     forced: Option<&str>,
     sets: &[zor::rules::RuleSet],
 ) -> anyhow::Result<u8> {
-    let source = std::fs::read_to_string(path)?;
+    let source =
+        zor::rules::bundle::read_bounded_utf8(path, zor::rules::bundle::MAX_FIXTURE_BYTES)?;
     let mut agent = forced.map(str::to_owned);
     let mut title = String::new();
     let mut progress = None;

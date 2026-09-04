@@ -1,5 +1,6 @@
 use std::{
     fs,
+    os::unix::fs::PermissionsExt as _,
     process::{Command, Stdio},
     thread,
     time::Duration,
@@ -71,6 +72,13 @@ fn sigusr1_writes_the_detection_window_fixture() -> Result<(), Box<dyn std::erro
         .find_map(|line| line.strip_prefix("zor: fixture written to "))
         .map(std::path::PathBuf::from);
     assert!(path.as_ref().is_some_and(|path| path.exists()));
+    assert_eq!(
+        path.as_ref()
+            .map(fs::metadata)
+            .transpose()?
+            .map(|metadata| metadata.permissions().mode() & 0o777),
+        Some(0o600)
+    );
     let contents = path
         .map(fs::read_to_string)
         .transpose()?
