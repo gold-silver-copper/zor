@@ -178,6 +178,10 @@ impl Machine {
             (None, None) => None,
         }
     }
+    #[must_use]
+    pub const fn current(&self) -> (State, Flags, u64) {
+        (self.current, self.visible, self.seq)
+    }
 
     fn publish(&mut self, state: State, visible: Flags, exited: bool, now: Instant) -> Event {
         let previous = self.current;

@@ -5,7 +5,16 @@ fn child_control_bytes_are_forwarded_exactly() -> Result<(), Box<dyn std::error:
     // Phase Z §5: CSI, OSC, DCS and queries reach stdout without rewriting.
     let expected = "\x1b[31m\x1b]2;title\x07\x1b]9;4;3;0\x1b\\\x1bPdata\x1b\\\x1b[c";
     let output = Command::new(env!("CARGO_BIN_EXE_zor"))
-        .args(["--", "/bin/sh", "-c", "printf %s \"$1\"", "sh", expected])
+        .args([
+            "--title",
+            "never",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf %s \"$1\"",
+            "sh",
+            expected,
+        ])
         .output()?;
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, expected.as_bytes());

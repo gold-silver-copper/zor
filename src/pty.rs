@@ -12,7 +12,7 @@ use crate::{
         title::{Mode as TitleMode, Titles},
     },
     osc::Report,
-    rules::{RuleSet, evaluate},
+    rules::{RuleSet, evaluate, view::ScreenView},
     screen::Screen,
     state::{Config, Event, Machine},
 };
@@ -103,6 +103,7 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     let mut active_agent = options.agent.clone();
     let mut scheduler = crate::platform::probe::Scheduler::new(std::time::Instant::now());
     let mut last_pgid = None;
+    let mut last_title = String::new();
     loop {
         let message = output_rx.recv_timeout(std::time::Duration::from_millis(50));
         let chunk = match message {
@@ -127,6 +128,17 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
             stdout.write_all(&chunk).context("write child output")?;
             stdout.flush().context("flush child output")?;
             let _ = screen.process(&chunk);
+            if screen.title() != last_title {
+                last_title = screen.title().to_owned();
+                let (state, _, _) = machine.current();
+                if let Some(bytes) = titles.observe(
+                    &last_title,
+                    state,
+                    active_agent.as_ref().map(crate::osc::AgentId::as_str),
+                ) {
+                    queued.push(bytes);
+                }
+            }
             if screen.changed() {
                 let verdict = active_agent
                     .as_ref()
@@ -284,6 +296,25 @@ fn queue_events(
             exited,
         } = event
         else {
+            if let Event::Heartbeat {
+                state,
+                agent,
+                seq,
+                visible,
+            } = event
+                && let Some(target) = sink
+            {
+                write_event_line(
+                    target,
+                    *state,
+                    None,
+                    agent.as_ref(),
+                    *seq,
+                    *visible,
+                    false,
+                    screen,
+                );
+            }
             continue;
         };
         if let Ok(report) = Report::new(*state, agent.clone(), *seq, *visible, *exited, None) {
@@ -299,33 +330,54 @@ fn queue_events(
             }
         }
         if let Some(target) = sink {
-            let time = timestamp();
-            let visible_names = [
-                (visible.idle, "idle"),
-                (visible.blocker, "blocker"),
-                (visible.working, "working"),
-            ]
-            .into_iter()
-            .filter_map(|(set, name)| set.then_some(name))
-            .collect();
-            let current_name = state_name(*state);
-            let previous_name = state_name(*previous);
-            let line = EventLine {
-                t: &time,
-                state: current_name,
-                previous: Some(previous_name),
-                agent: agent.as_ref().map(crate::osc::AgentId::as_str),
-                seq: *seq,
-                pid: None,
-                code: None,
-                title: Some(screen.title()),
-                visible: visible_names,
-                exited: *exited,
-            };
-            if let Ok(bytes) = encode(&line) {
-                target.write(&bytes);
-            }
+            write_event_line(
+                target,
+                *state,
+                Some(*previous),
+                agent.as_ref(),
+                *seq,
+                *visible,
+                *exited,
+                screen,
+            );
         }
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn write_event_line(
+    target: &mut Sink,
+    state: crate::osc::State,
+    previous: Option<crate::osc::State>,
+    agent: Option<&crate::osc::AgentId>,
+    seq: u64,
+    visible: crate::osc::Flags,
+    exited: bool,
+    screen: &Screen,
+) {
+    use crate::rules::view::ScreenView;
+    let time = timestamp();
+    let visible_names = [
+        (visible.idle, "idle"),
+        (visible.blocker, "blocker"),
+        (visible.working, "working"),
+    ]
+    .into_iter()
+    .filter_map(|(set, name)| set.then_some(name))
+    .collect();
+    let line = EventLine {
+        t: &time,
+        state: state_name(state),
+        previous: previous.map(state_name),
+        agent: agent.map(crate::osc::AgentId::as_str),
+        seq,
+        pid: None,
+        code: None,
+        title: Some(screen.title()),
+        visible: visible_names,
+        exited,
+    };
+    if let Ok(bytes) = encode(&line) {
+        target.write(&bytes);
     }
 }
 fn state_name(state: crate::osc::State) -> &'static str {
