@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.91"
 license = "MIT"
 description = "Portable agent-state wrapper and OSC 7877 protocol"
+repository = "https://github.com/gold-silver-copper/zor"
+homepage = "https://github.com/gold-silver-copper/zor"
+documentation = "https://docs.rs/zor"
+readme = "README.md"
 
 [features]
 default = ["cli"]
