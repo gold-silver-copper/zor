@@ -71,10 +71,17 @@ enum Target {
     #[cfg(test)]
     Test(Box<dyn Write + Send>),
 }
+const MAX_PENDING_RECORD: usize = 2_048;
+
+struct Pending {
+    bytes: Vec<u8>,
+    offset: usize,
+}
 pub struct Sink {
     path: PathBuf,
     target: Option<Target>,
     retry_at: Instant,
+    pending: Option<Pending>,
     pub dropped: u64,
 }
 impl Sink {
@@ -83,28 +90,67 @@ impl Sink {
             path: path.into(),
             target: None,
             retry_at: Instant::now(),
+            pending: None,
             dropped: 0,
         };
         value.reconnect();
         value
     }
     pub fn write(&mut self, line: &[u8]) {
+        self.flush_pending();
+        if self.pending.is_some() {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        if line.len() > MAX_PENDING_RECORD {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        self.pending = Some(Pending {
+            bytes: line.to_vec(),
+            offset: 0,
+        });
+        self.flush_pending();
+    }
+    fn flush_pending(&mut self) {
+        if self.pending.is_none() {
+            return;
+        }
         if self.target.is_none() && Instant::now() >= self.retry_at {
             self.reconnect();
         }
-        let result = match self.target.as_mut() {
-            Some(Target::Socket(value)) => value.write(line),
-            Some(Target::File(value)) => value.write(line),
-            #[cfg(test)]
-            Some(Target::Test(value)) => value.write(line),
-            None => return,
+        let Some(target) = self.target.as_mut() else {
+            return;
         };
-        if !matches!(result, Ok(written) if written == line.len()) {
-            self.dropped = self.dropped.saturating_add(1);
-            // A partial JSON line cannot safely share a stream with a later record. Closing the
-            // target gives socket readers an EOF boundary at which to discard the fragment.
-            self.target = None;
-            self.retry_at = Instant::now() + Duration::from_secs(1);
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        let remaining = pending.bytes.get(pending.offset..).unwrap_or_default();
+        let result = match target {
+            Target::Socket(value) => value.write(remaining),
+            Target::File(value) => value.write(remaining),
+            #[cfg(test)]
+            Target::Test(value) => value.write(remaining),
+        };
+        match result {
+            Ok(0) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Ok(written) => {
+                pending.offset = pending
+                    .offset
+                    .saturating_add(written)
+                    .min(pending.bytes.len());
+                if pending.offset == pending.bytes.len() {
+                    self.pending = None;
+                }
+            }
+            Err(_) => {
+                // A new connection cannot continue a record whose prefix went to the old one.
+                // Restart the bounded record after the reconnect boundary.
+                pending.offset = 0;
+                self.target = None;
+                self.retry_at = Instant::now() + Duration::from_secs(1);
+            }
         }
     }
     fn reconnect(&mut self) {
@@ -144,6 +190,7 @@ fn open_target(path: &Path) -> io::Result<Target> {
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::sync::{Arc, Mutex};
 
     struct PartialWriter {
@@ -225,6 +272,7 @@ mod tests {
             path: PathBuf::new(),
             target: Some(Target::Socket(writer)),
             retry_at: Instant::now(),
+            pending: None,
             dropped: 0,
         };
         let line = vec![b'x'; 65_536];
@@ -238,8 +286,8 @@ mod tests {
     }
 
     #[test]
-    fn partial_write_closes_the_target_before_another_json_line() {
-        // Phase Z §6: a short nonblocking write cannot prefix-corrupt a later JSON record.
+    fn partial_write_finishes_before_accepting_another_json_line() {
+        // Phase Z §6: short writes retain one bounded record and drop newer backpressure traffic.
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let mut sink = Sink {
             path: PathBuf::new(),
@@ -247,15 +295,87 @@ mod tests {
                 bytes: Arc::clone(&bytes),
             }))),
             retry_at: Instant::now(),
+            pending: None,
             dropped: 0,
         };
         sink.write(b"{\"one\":1}\n");
         sink.write(b"{\"two\":2}\n");
         assert_eq!(sink.dropped, 1);
-        assert!(sink.target.is_none());
+        while sink.pending.is_some() {
+            sink.flush_pending();
+        }
+        sink.write(b"{\"three\":3}\n");
+        while sink.pending.is_some() {
+            sink.flush_pending();
+        }
         assert_eq!(
             bytes.lock().map(|value| value.clone()).unwrap_or_default(),
-            b"{\"o"
+            b"{\"one\":1}\n{\"three\":3}\n"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn nonblocking_file_target_never_concatenates_after_pressure() {
+        // Phase Z §6: fd3-style shared descriptors preserve JSONL boundaries under pressure.
+        let (mut writer, mut reader) =
+            UnixStream::pair().unwrap_or_else(|error| panic!("socket pair: {error}"));
+        writer
+            .set_nonblocking(true)
+            .unwrap_or_else(|error| panic!("nonblocking: {error}"));
+        let filler = [b'x'; 8_192];
+        let mut filled = 0usize;
+        loop {
+            match writer.write(&filler) {
+                Ok(count) => filled = filled.saturating_add(count),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill pressure: {error}"),
+            }
+        }
+        let owned: std::os::fd::OwnedFd = writer.into();
+        let mut sink = Sink {
+            path: PathBuf::new(),
+            target: Some(Target::File(File::from(owned))),
+            retry_at: Instant::now(),
+            pending: None,
+            dropped: 0,
+        };
+        sink.write(b"{\"seq\":1}\n");
+        sink.write(b"{\"seq\":2}\n");
+        assert_eq!(sink.dropped, 1);
+        let mut discarded = vec![0; filled];
+        reader
+            .read_exact(&mut discarded)
+            .unwrap_or_else(|error| panic!("drain filler: {error}"));
+        sink.flush_pending();
+        sink.write(b"{\"seq\":3}\n");
+        reader
+            .set_nonblocking(true)
+            .unwrap_or_else(|error| panic!("reader nonblocking: {error}"));
+        let mut records = Vec::new();
+        loop {
+            let mut bytes = [0_u8; 128];
+            match reader.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(count) => records.extend_from_slice(bytes.get(..count).unwrap_or_default()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("read records: {error}"),
+            }
+        }
+        let decoded: Vec<serde_json::Value> = records
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_slice)
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|error| panic!("decode records: {error}; bytes={records:?}"));
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(
+            decoded.first().and_then(|value| value.get("seq")),
+            Some(&1.into())
+        );
+        assert_eq!(
+            decoded.get(1).and_then(|value| value.get("seq")),
+            Some(&3.into())
         );
     }
 }

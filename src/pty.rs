@@ -250,9 +250,13 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                 } else if signal == signal_hook::consts::SIGUSR1 {
                     write_fixture(&screen, options.agent.as_ref());
                 } else if signal == signal_hook::consts::SIGTSTP {
-                    if let Some(pgid) = signal_target(last_pgid, child_pgid) {
-                        let _ = crate::platform::forward_signal(pgid, signal);
-                    }
+                    let _ = forward_signal_with_retry(
+                        last_pgid,
+                        pair.master.process_group_leader(),
+                        child_pgid,
+                        signal,
+                        crate::platform::forward_signal,
+                    );
                     drop(raw_guard.take());
                     crate::platform::suspend_self();
                     raw_guard = crate::platform::set_raw(0).ok();
@@ -260,11 +264,21 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                     if raw_guard.is_none() {
                         raw_guard = crate::platform::set_raw(0).ok();
                     }
-                    if let Some(pgid) = signal_target(last_pgid, child_pgid) {
-                        let _ = crate::platform::forward_signal(pgid, signal);
-                    }
-                } else if let Some(pgid) = signal_target(last_pgid, child_pgid) {
-                    let _ = crate::platform::forward_signal(pgid, signal);
+                    let _ = forward_signal_with_retry(
+                        last_pgid,
+                        pair.master.process_group_leader(),
+                        child_pgid,
+                        signal,
+                        crate::platform::forward_signal,
+                    );
+                } else {
+                    let _ = forward_signal_with_retry(
+                        last_pgid,
+                        pair.master.process_group_leader(),
+                        child_pgid,
+                        signal,
+                        crate::platform::forward_signal,
+                    );
                 }
                 None
             }
@@ -471,10 +485,31 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     Ok(u8::try_from(code).unwrap_or(u8::MAX))
 }
 
-fn signal_target(foreground_pgid: Option<i32>, child_pgid: Option<i32>) -> Option<i32> {
-    foreground_pgid
+fn forward_signal_with_retry(
+    cached_pgid: Option<i32>,
+    current_pgid: Option<i32>,
+    child_pgid: Option<i32>,
+    signal: i32,
+    mut forward: impl FnMut(i32, i32) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut last_error = None;
+    let mut attempted = Vec::with_capacity(3);
+    for pgid in [cached_pgid, current_pgid, child_pgid]
+        .into_iter()
+        .flatten()
         .filter(|pgid| *pgid > 0)
-        .or_else(|| child_pgid.filter(|pgid| *pgid > 0))
+    {
+        if attempted.contains(&pgid) {
+            continue;
+        }
+        attempted.push(pgid);
+        match forward(pgid, signal) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no live child process group")))
 }
 
 fn restore_on_error<T>(result: Result<T>, titles: &Titles, stdout: &mut impl Write) -> Result<T> {
@@ -691,13 +726,27 @@ pub fn run_transparent(command: &str, argv: &[String]) -> Result<u8> {
 
 #[cfg(test)]
 mod signal_tests {
-    use super::signal_target;
+    use super::forward_signal_with_retry;
 
     #[test]
-    fn foreground_process_group_precedes_validated_child_fallback() {
-        // Phase Z §4-5: forwarded signals follow the active foreground job when known.
-        assert_eq!(signal_target(Some(42), Some(7)), Some(42));
-        assert_eq!(signal_target(None, Some(7)), Some(7));
-        assert_eq!(signal_target(Some(0), Some(-1)), None);
+    fn failed_cached_group_retries_current_then_child_fallback() {
+        // Phase Z §4-5: a raced cached pgid refreshes tcgetpgrp before using the child group.
+        let mut attempts = Vec::new();
+        let result = forward_signal_with_retry(Some(42), Some(43), Some(7), 15, |pgid, _| {
+            attempts.push(pgid);
+            (pgid == 7)
+                .then_some(())
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert!(result.is_ok());
+        assert_eq!(attempts, [42, 43, 7]);
+
+        attempts.clear();
+        let result = forward_signal_with_retry(Some(42), Some(43), Some(7), 15, |pgid, _| {
+            attempts.push(pgid);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(attempts, [42]);
     }
 }
