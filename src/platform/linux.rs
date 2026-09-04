@@ -93,28 +93,29 @@ fn process(pid: Pid) -> Option<Process> {
 
 pub struct Guard {
     fd: i32,
-    original: libc::termios,
+    original: nix::sys::termios::Termios,
 }
 impl Drop for Guard {
     fn drop(&mut self) {
         unsafe {
-            // SAFETY: original was initialized by tcgetattr for this live fd.
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+            // SAFETY: Guard owns a valid borrowed descriptor for its lifetime.
+            let fd = std::os::fd::BorrowedFd::borrow_raw(self.fd);
+            let _ = nix::sys::termios::tcsetattr(
+                fd,
+                nix::sys::termios::SetArg::TCSANOW,
+                &self.original,
+            );
         }
     }
 }
 pub fn set_raw(fd: i32) -> io::Result<Guard> {
     unsafe {
-        // SAFETY: termios is plain data and libc validates the fd.
-        let mut original = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut original) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut raw = original;
-        libc::cfmakeraw(&mut raw);
-        if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        // SAFETY: nix borrows but does not retain the descriptor.
+        let borrowed = std::os::fd::BorrowedFd::borrow_raw(fd);
+        let original = nix::sys::termios::tcgetattr(borrowed)?;
+        let mut raw = original.clone();
+        nix::sys::termios::cfmakeraw(&mut raw);
+        nix::sys::termios::tcsetattr(borrowed, nix::sys::termios::SetArg::TCSANOW, &raw)?;
         Ok(Guard { fd, original })
     }
 }

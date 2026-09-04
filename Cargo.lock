@@ -865,6 +865,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "nix",
  "portable-pty",
  "proptest",
  "regex",

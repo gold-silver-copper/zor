@@ -131,3 +131,90 @@ fn basename(value: &str) -> String {
         .unwrap_or(name)
         .to_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::load;
+    #[allow(clippy::panic)]
+    fn sets() -> Vec<RuleSet> {
+        vec![
+            load(
+                Path::new("test.toml"),
+                "id='claude'\nprompt_marker='>'\nblock_markers=[]\nrules=[]\n",
+            )
+            .unwrap_or_else(|error| panic!("{error}")),
+        ]
+    }
+    fn process(pid: i32, comm: &str, argv: &[&str]) -> Process {
+        Process {
+            pid,
+            ppid: 1,
+            comm: comm.to_owned(),
+            argv0: None,
+            argv: argv.iter().map(|value| (*value).to_owned()).collect(),
+            env_agent: None,
+        }
+    }
+    #[test]
+    fn wrapped_runtime_and_eval_flags_are_classified() {
+        // Phase Z §2: runtimes resolve scripts while eval/module forms are rejected.
+        let sets = sets();
+        let job = Job {
+            leader: 2,
+            processes: vec![process(
+                2,
+                "node",
+                &["node", "-r", "hook.js", "/x/claude.js"],
+            )],
+        };
+        assert!(identify(&job, &sets).is_some());
+        for argv in [
+            vec!["node", "-e", "x"],
+            vec!["python", "-m", "claude"],
+            vec!["sh", "-c", "claude"],
+        ] {
+            let job = Job {
+                leader: 2,
+                processes: vec![process(2, argv.first().copied().unwrap_or_default(), &argv)],
+            };
+            assert!(identify(&job, &sets).is_none());
+        }
+    }
+    #[test]
+    fn environment_override_and_leader_win() {
+        // Phase Z §2: ZOR_AGENT wins outright and matching leaders beat later processes.
+        let sets = sets();
+        let mut overridden = process(9, "unknown", &["unknown"]);
+        overridden.env_agent = Some("claude".to_owned());
+        assert_eq!(
+            identify(
+                &Job {
+                    leader: 2,
+                    processes: vec![overridden]
+                },
+                &sets
+            )
+            .map(|(_, pid)| pid),
+            Some(9)
+        );
+        let job = Job {
+            leader: 2,
+            processes: vec![
+                process(3, "claude", &["claude"]),
+                process(2, "claude", &["claude"]),
+            ],
+        };
+        assert_eq!(identify(&job, &sets).map(|(_, pid)| pid), Some(2));
+        assert!(
+            identify(
+                &Job {
+                    leader: 4,
+                    processes: vec![process(4, "tmux", &["tmux", "claude"])]
+                },
+                &sets
+            )
+            .is_none()
+        );
+    }
+}

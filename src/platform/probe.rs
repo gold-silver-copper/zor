@@ -103,6 +103,12 @@ impl Scheduler {
         hold: bool,
         pgid_changed: bool,
     ) -> bool {
+        if self
+            .acquisition
+            .is_some_and(|opened| now.duration_since(opened) >= Duration::from_secs(8))
+        {
+            self.acquisition = None;
+        }
         if pgid_changed && !identified {
             self.acquisition = Some(now);
         }
@@ -183,5 +189,28 @@ mod tests {
             assert_eq!(tracker.update(None, false), None);
         }
         assert_eq!(tracker.update(None, false), Some(Detection::AgentLost));
+    }
+
+    #[test]
+    fn scheduler_runs_five_second_reprobe_and_bounded_acquisition_phases() {
+        // Phase Z §4: full probes recur at 5 s and acquisition ends after its 8 s window.
+        let start = Instant::now();
+        let mut scheduler = Scheduler::new(start);
+        assert!(scheduler.completed(start, false, false, true));
+        for millis in [500, 1_000] {
+            let now = start + Duration::from_millis(millis);
+            assert!(scheduler.due(now));
+            assert!(scheduler.completed(now, false, false, false));
+        }
+        let slow = start + Duration::from_millis(1_500);
+        assert!(scheduler.completed(slow, false, false, false));
+        assert!(!scheduler.due(slow + Duration::from_millis(1_999)));
+        let ended = start + Duration::from_secs(8);
+        let _ = scheduler.completed(ended, false, false, false);
+        assert!(scheduler.due(ended + Duration::from_millis(500)));
+        let mut identified = Scheduler::new(start);
+        assert!(identified.completed(start, true, false, true));
+        assert!(!identified.completed(start + Duration::from_secs(4), true, false, false));
+        assert!(identified.completed(start + Duration::from_secs(5), true, false, false));
     }
 }

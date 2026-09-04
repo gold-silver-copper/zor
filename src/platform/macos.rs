@@ -60,8 +60,11 @@ fn process(pid: Pid) -> Option<Process> {
     }
     .to_string_lossy()
     .into_owned();
-    let (argv0, argv, env_agent) =
+    let (argv0, argv, mut env_agent) =
         arguments(pid).unwrap_or_else(|| (Some(comm.clone()), vec![comm.clone()], None));
+    if env_agent.is_none() {
+        env_agent = environment_fallback(pid);
+    }
     Some(Process {
         pid,
         ppid: value.pbi_ppid as Pid,
@@ -70,6 +73,16 @@ fn process(pid: Pid) -> Option<Process> {
         argv,
         env_agent,
     })
+}
+
+fn environment_fallback(pid: Pid) -> Option<String> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["eww", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("ZOR_AGENT=").map(str::to_owned))
 }
 
 fn arguments(pid: Pid) -> Option<(Option<String>, Vec<String>, Option<String>)> {
@@ -113,7 +126,8 @@ fn arguments(pid: Pid) -> Option<(Option<String>, Vec<String>, Option<String>)> 
             argv.push(String::from_utf8_lossy(fields.next()?).into_owned());
         }
         let argv0 = argv.first().cloned();
-        let env_agent = fields
+        let env_agent = bytes
+            .split(|byte| *byte == 0)
             .find_map(|field| field.strip_prefix(b"ZOR_AGENT="))
             .map(|value| String::from_utf8_lossy(value).into_owned());
         Some((argv0, argv, env_agent))
@@ -121,28 +135,29 @@ fn arguments(pid: Pid) -> Option<(Option<String>, Vec<String>, Option<String>)> 
 }
 pub struct Guard {
     fd: i32,
-    original: libc::termios,
+    original: nix::sys::termios::Termios,
 }
 impl Drop for Guard {
     fn drop(&mut self) {
         unsafe {
-            // SAFETY: original was initialized by tcgetattr for this live fd.
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+            // SAFETY: Guard owns a valid borrowed descriptor for its lifetime.
+            let fd = std::os::fd::BorrowedFd::borrow_raw(self.fd);
+            let _ = nix::sys::termios::tcsetattr(
+                fd,
+                nix::sys::termios::SetArg::TCSANOW,
+                &self.original,
+            );
         }
     }
 }
 pub fn set_raw(fd: i32) -> io::Result<Guard> {
     unsafe {
-        // SAFETY: termios is plain data and libc validates the fd.
-        let mut original = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut original) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut raw = original;
-        libc::cfmakeraw(&mut raw);
-        if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        // SAFETY: nix borrows but does not retain the descriptor.
+        let borrowed = std::os::fd::BorrowedFd::borrow_raw(fd);
+        let original = nix::sys::termios::tcgetattr(borrowed)?;
+        let mut raw = original.clone();
+        nix::sys::termios::cfmakeraw(&mut raw);
+        nix::sys::termios::tcsetattr(borrowed, nix::sys::termios::SetArg::TCSANOW, &raw)?;
         Ok(Guard { fd, original })
     }
 }
@@ -188,20 +203,68 @@ pub fn suspend_self() {
 mod tests {
     use super::*;
     #[test]
-    #[ignore = "requires an interactive controlling tty"]
+    #[allow(clippy::panic)]
     fn raw_guard_restores_terminal_attributes() {
         // Phase Z §4: raw mode is restored when its guard drops.
-        let fd = 0;
         unsafe {
-            // SAFETY: fd belongs to the live PTY and termios buffers are initialized.
-            let mut before: libc::termios = std::mem::zeroed();
-            assert_eq!(libc::tcgetattr(fd, &mut before), 0);
+            // SAFETY: openpty initializes both descriptors; all termios buffers have valid sizes.
+            let mut master = -1;
+            let mut fd = -1;
+            assert_eq!(
+                libc::openpty(
+                    &mut master,
+                    &mut fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+            let borrowed = std::os::fd::BorrowedFd::borrow_raw(fd);
+            let before = nix::sys::termios::tcgetattr(borrowed)
+                .unwrap_or_else(|error| panic!("tcgetattr: {error}"));
             let Ok(guard) = set_raw(fd) else { return };
             drop(guard);
-            let mut after: libc::termios = std::mem::zeroed();
-            assert_eq!(libc::tcgetattr(fd, &mut after), 0);
-            assert_eq!(before.c_lflag, after.c_lflag);
-            assert_eq!(before.c_iflag, after.c_iflag);
+            let after = nix::sys::termios::tcgetattr(borrowed)
+                .unwrap_or_else(|error| panic!("tcgetattr: {error}"));
+            assert_eq!(before.input_flags, after.input_flags);
+            assert_eq!(before.output_flags, after.output_flags);
+            assert_eq!(before.control_flags, after.control_flags);
+            assert_eq!(
+                before.local_flags,
+                after.local_flags & !nix::sys::termios::LocalFlags::PENDIN
+            );
+            assert_eq!(before.control_chars, after.control_chars);
+            libc::close(master);
+            libc::close(fd);
         }
+    }
+
+    #[test]
+    fn spawned_job_exposes_processes_and_arguments() -> anyhow::Result<()> {
+        // Phase Z §4: the real platform adapter lists a spawned job and its argv.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 2"])
+            .env("ZOR_AGENT", "claude")
+            .spawn()?;
+        let pid = i32::try_from(child.id())?;
+        let mut child_process = None;
+        for _ in 0..20 {
+            child_process = process(pid);
+            if child_process.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let child_process = child_process.ok_or_else(|| anyhow::anyhow!("child unavailable"))?;
+        let pgid = info(pid)
+            .map(|value| value.pbi_pgid as Pid)
+            .ok_or_else(|| anyhow::anyhow!("child has no process group"))?;
+        let listing = job(pid, pgid);
+        assert!(child_process.argv.iter().any(|arg| arg == "sleep 2"));
+        assert!(listing.processes.iter().any(|process| process.pid == pid));
+        child.kill()?;
+        let _ = child.wait()?;
+        Ok(())
     }
 }

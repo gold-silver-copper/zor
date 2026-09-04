@@ -361,4 +361,118 @@ mod tests {
             ]
         ));
     }
+
+    #[test]
+    fn startup_grace_drops_idle_but_passes_blocked() {
+        // Phase Z §3: only idle is suppressed during startup grace.
+        let start = Instant::now();
+        let mut machine = Machine::new(Config::default());
+        let found = machine.observe(
+            Some(verdict(RuleState::Idle, Flags::default())),
+            agent(),
+            Some(1),
+            false,
+            start,
+        );
+        assert!(matches!(found.as_slice(), [Event::AgentFound { .. }]));
+        assert!(matches!(
+            machine
+                .observe(
+                    Some(verdict(RuleState::Blocked, Flags::default())),
+                    agent(),
+                    Some(1),
+                    false,
+                    start
+                )
+                .as_slice(),
+            [Event::Changed {
+                state: State::Blocked,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn skip_cancels_hold_and_flag_changes_publish_immediately() {
+        // Phase Z §3: Skip cancels pending idle and visible flags are state changes.
+        let start = Instant::now();
+        let mut machine = Machine::new(Config {
+            startup_grace: Duration::ZERO,
+            ..Config::default()
+        });
+        let _ = machine.observe(
+            Some(verdict(RuleState::Working, Flags::default())),
+            agent(),
+            Some(1),
+            false,
+            start,
+        );
+        let _ = machine.observe(
+            Some(verdict(RuleState::Idle, Flags::default())),
+            agent(),
+            Some(1),
+            false,
+            start,
+        );
+        assert!(machine.next_deadline().is_some());
+        assert!(
+            machine
+                .observe(
+                    Some(verdict(RuleState::Skip, Flags::default())),
+                    agent(),
+                    Some(1),
+                    false,
+                    start
+                )
+                .is_empty()
+        );
+        assert!(machine.tick(start + Duration::from_millis(700)).is_empty());
+        let changed = machine.observe(
+            Some(verdict(
+                RuleState::Working,
+                Flags {
+                    working: true,
+                    ..Flags::default()
+                },
+            )),
+            agent(),
+            Some(1),
+            false,
+            start,
+        );
+        assert!(matches!(
+            changed.as_slice(),
+            [Event::Changed {
+                visible: Flags { working: true, .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn exit_publishes_idle_with_marker() {
+        // Phase Z §3: agent exit is an immediate idle transition with exited set.
+        let start = Instant::now();
+        let mut machine = Machine::new(Config {
+            startup_grace: Duration::ZERO,
+            ..Config::default()
+        });
+        let _ = machine.observe(
+            Some(verdict(RuleState::Working, Flags::default())),
+            agent(),
+            Some(1),
+            false,
+            start,
+        );
+        assert!(matches!(
+            machine
+                .observe(None, agent(), Some(1), true, start)
+                .as_slice(),
+            [Event::Changed {
+                state: State::Idle,
+                exited: true,
+                ..
+            }]
+        ));
+    }
 }
