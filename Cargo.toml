@@ -1,0 +1,44 @@
+[package]
+name = "zor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+description = "Portable agent-state wrapper and OSC 7877 protocol"
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+
+[dependencies]
+# Command-line parsing for the feature-gated wrapper binary.
+clap = { version = "4.5", features = ["derive"], optional = true }
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+# Property testing proves the byte parser is total.
+proptest = "1.7"
+# Terminal-emulator callback integration tests the joined OSC payload contract.
+vt100 = "=0.16.2"
+
+[[bin]]
+name = "zor"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[lints.rust]
+dead_code = "deny"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+string_slice = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unwrap_used = "deny"
