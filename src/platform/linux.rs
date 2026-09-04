@@ -41,7 +41,7 @@ pub fn job(child: Pid, pgid: Pid) -> Job {
                     queue.extend(
                         children
                             .split_whitespace()
-                            .filter_map(|value| value.parse().ok()),
+                            .filter_map(|value| value.parse::<i32>().ok()),
                     );
                 }
             }
