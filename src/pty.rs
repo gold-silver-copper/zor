@@ -68,6 +68,9 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     });
     thread::spawn(move || {
         let _ = io::copy(&mut io::stdin().lock(), &mut writer);
+        // A terminal has no pipe-style EOF. portable-pty's writer drop synthesizes
+        // VEOF, which can be echoed into stdout and violate byte passthrough.
+        std::mem::forget(writer);
     });
 
     let signal_tx = output_tx;
@@ -217,7 +220,24 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     {
         eprintln!("zor: dropped event lines: {}", value.dropped);
     }
-    Ok(u8::try_from(status.exit_code()).unwrap_or(u8::MAX))
+    let code = status
+        .signal()
+        .and_then(signal_number)
+        .map_or(status.exit_code(), |signal| 128 + signal);
+    Ok(u8::try_from(code).unwrap_or(u8::MAX))
+}
+
+fn signal_number(name: &str) -> Option<u32> {
+    [
+        ("Hangup", 1),
+        ("Interrupt", 2),
+        ("Quit", 3),
+        ("Killed", 9),
+        ("Terminated", 15),
+        ("Stopped", 19),
+    ]
+    .into_iter()
+    .find_map(|(label, number)| name.contains(label).then_some(number))
 }
 
 fn write_fixture(screen: &Screen, agent: Option<&crate::osc::AgentId>) {
