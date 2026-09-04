@@ -1,3 +1,4 @@
+#![cfg(feature = "cli")]
 #![allow(clippy::indexing_slicing)]
 
 use std::{

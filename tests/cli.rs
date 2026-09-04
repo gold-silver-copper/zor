@@ -1,3 +1,5 @@
+#![cfg(feature = "cli")]
+
 use std::{
     fs,
     os::unix::fs::PermissionsExt as _,
