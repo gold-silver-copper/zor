@@ -3,6 +3,10 @@ use std::borrow::Cow;
 
 const SCROLLBACK_LINES: usize = u16::MAX as usize;
 const MAX_TITLE_CHARS: usize = 256;
+/// Maximum bytes retained by the terminal parser for one OSC/DCS/SOS/PM/APC payload. Child bytes
+/// are still passed through unchanged; only the bounded observation model discards an overlong
+/// unterminated control string.
+const MAX_CONTROL_STRING_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
 struct Callbacks {
@@ -75,6 +79,8 @@ enum Sequence {
     String {
         osc: bool,
         escape: bool,
+        bytes: usize,
+        discarded: bool,
     },
 }
 
@@ -84,6 +90,7 @@ struct BoundaryTracker {
 }
 
 impl BoundaryTracker {
+    #[cfg(test)]
     fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             self.byte(byte);
@@ -98,6 +105,8 @@ impl BoundaryTracker {
                 0x90 | 0x98 | 0x9d | 0x9e | 0x9f => Sequence::String {
                     osc: byte == 0x9d,
                     escape: false,
+                    bytes: 0,
+                    discarded: false,
                 },
                 _ => Sequence::Ground,
             },
@@ -106,6 +115,8 @@ impl BoundaryTracker {
                 b']' | b'P' | b'X' | b'^' | b'_' => Sequence::String {
                     osc: byte == b']',
                     escape: false,
+                    bytes: 0,
+                    discarded: false,
                 },
                 0x18 | 0x1a => Sequence::Ground,
                 0x20..=0x2f => Sequence::Escape,
@@ -117,7 +128,12 @@ impl BoundaryTracker {
                 0x40..=0x7e => Sequence::Ground,
                 _ => Sequence::Csi,
             },
-            Sequence::String { osc, escape } => {
+            Sequence::String {
+                osc,
+                escape,
+                bytes,
+                discarded,
+            } => {
                 if matches!(byte, 0x18 | 0x1a)
                     || byte == 0x9c
                     || (osc && byte == 0x07)
@@ -125,12 +141,50 @@ impl BoundaryTracker {
                 {
                     Sequence::Ground
                 } else if byte == 0x1b {
-                    Sequence::String { osc, escape: true }
+                    Sequence::String {
+                        osc,
+                        escape: true,
+                        bytes: bytes.saturating_add(1),
+                        discarded: discarded || bytes >= MAX_CONTROL_STRING_BYTES,
+                    }
                 } else {
-                    Sequence::String { osc, escape: false }
+                    Sequence::String {
+                        osc,
+                        escape: false,
+                        bytes: bytes.saturating_add(1),
+                        discarded: discarded || bytes >= MAX_CONTROL_STRING_BYTES,
+                    }
                 }
             }
         };
+    }
+
+    /// Returns the byte the VT parser may consume. The first over-limit byte is replaced by CAN,
+    /// resetting the parser without retaining the accumulated string; subsequent bytes through
+    /// the real terminator are observed only by this constant-space boundary state machine.
+    fn parser_byte(&mut self, byte: u8) -> Option<u8> {
+        let was_discarding = matches!(
+            self.state,
+            Sequence::String {
+                discarded: true,
+                ..
+            }
+        );
+        self.byte(byte);
+        if was_discarding {
+            return None;
+        }
+        if matches!(
+            self.state,
+            Sequence::String {
+                discarded: true,
+                ..
+            }
+        ) {
+            Some(0x18)
+        } else {
+            Some(byte)
+        }
     }
 
     const fn ground(&self) -> bool {
@@ -175,9 +229,37 @@ impl Screen {
             self.parser.screen().cursor_position(),
             self.parser.screen().alternate_screen(),
         );
+        let callback_snapshot = {
+            let callbacks = self.parser.callbacks();
+            (
+                callbacks.title.clone(),
+                callbacks.bells,
+                callbacks.progress,
+                callbacks.observed_reports.len(),
+            )
+        };
         self.parser.callbacks_mut().event = false;
-        self.parser.process(bytes);
-        self.boundary.feed(bytes);
+        let mut filtered = Vec::with_capacity(bytes.len().min(8192));
+        let mut discarded_control = false;
+        for &byte in bytes {
+            if let Some(byte) = self.boundary.parser_byte(byte) {
+                discarded_control |= byte == 0x18;
+                filtered.push(byte);
+                if filtered.len() == 8192 {
+                    self.parser.process(&filtered);
+                    filtered.clear();
+                }
+            }
+        }
+        self.parser.process(&filtered);
+        if discarded_control {
+            let callbacks = self.parser.callbacks_mut();
+            callbacks.title = callback_snapshot.0;
+            callbacks.bells = callback_snapshot.1;
+            callbacks.progress = callback_snapshot.2;
+            callbacks.observed_reports.truncate(callback_snapshot.3);
+            callbacks.event = false;
+        }
         let after = self.parser.screen();
         self.changed = before
             != (
@@ -310,6 +392,46 @@ mod tests {
                 assert!(tracker.ground());
             }
         }
+    }
+
+    #[test]
+    fn overlong_chunked_control_strings_are_discarded_and_parser_recovers() {
+        for (start, end) in [
+            (b"\x1b]2;".as_slice(), b"\x07".as_slice()),
+            (b"\x1bP".as_slice(), b"\x1b\\".as_slice()),
+            (b"\x1b_".as_slice(), b"\x1b\\".as_slice()),
+        ] {
+            let mut screen = Screen::new(4, 20);
+            assert!(!screen.process(start));
+            let chunk = vec![b'x'; 1024];
+            for _ in 0..=(MAX_CONTROL_STRING_BYTES / chunk.len()) {
+                assert!(!screen.process(&chunk));
+            }
+            if end == b"\x1b\\" {
+                assert!(!screen.process(b"\x1b"));
+                assert!(screen.process(b"\\"));
+            } else {
+                assert!(screen.process(end));
+            }
+            assert!(screen.process(b"RECOVERED"));
+            assert_eq!(screen.text(), "RECOVERED\n");
+            assert_eq!(screen.title(), "");
+            assert!(screen.take_observed_reports().is_empty());
+        }
+    }
+
+    #[test]
+    fn valid_split_agent_osc_remains_observable_below_the_limit() {
+        let mut screen = Screen::new(4, 20);
+        for chunk in [
+            b"\x1b]7877;state=blocked;agent=a;".as_slice(),
+            b"seq=1;visible=blocker;exited=0\x1b",
+            b"\\",
+        ] {
+            screen.process(chunk);
+        }
+        assert_eq!(screen.take_observed_reports().len(), 1);
+        assert!(screen.ground());
     }
 
     #[test]
