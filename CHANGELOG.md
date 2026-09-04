@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 - 2026-09-04
+
+- Propagate nested PTY resizes reliably.
+- Reap the complete nested process group when the wrapper terminates.
+
 ## 0.1.1 - 2026-09-03
 
 - Fix Linux process-child parsing on stable Rust by making the PID type explicit.
