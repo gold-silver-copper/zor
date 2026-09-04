@@ -2,3 +2,10 @@
 #![forbid(unsafe_code)]
 
 pub mod osc;
+
+#[cfg(feature = "cli")]
+pub mod rules;
+#[cfg(feature = "cli")]
+pub mod screen;
+#[cfg(feature = "cli")]
+pub mod state;
