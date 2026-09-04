@@ -61,9 +61,16 @@ fn load_dir(
 }
 
 pub fn read_bounded_utf8(path: &Path, limit: usize) -> Result<String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        anyhow::bail!("input is not a regular file");
+    }
+    file.take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() > limit {
         anyhow::bail!("input exceeds {limit} bytes");
@@ -94,5 +101,18 @@ mod tests {
         let mut files = MAX_RULE_FILES;
         assert!(load_dir(&directory, &mut sets, &mut files).is_err());
         std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn bounded_reader_rejects_fifo_without_waiting_for_a_writer() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+        let path = std::env::temp_dir().join(format!("zor-bounded-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).expect("fifo");
+        let started = std::time::Instant::now();
+        assert!(read_bounded_utf8(&path, 16).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        std::fs::remove_file(path).expect("cleanup");
     }
 }

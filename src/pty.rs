@@ -3,8 +3,8 @@ use portable_pty::{CommandBuilder, NativePtySystem, PtySystem};
 use std::{
     io::{self, Read, Write},
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -32,12 +32,21 @@ fn queue_injection(queued: &mut Vec<Vec<u8>>, bytes: Vec<u8>) {
 }
 
 fn take_pending_signal(pending: &AtomicU64) -> Option<i32> {
-    let bits = pending.load(Ordering::Acquire);
-    let index = bits.trailing_zeros();
-    (index < u64::BITS).then(|| {
-        pending.fetch_and(!(1_u64 << index), Ordering::AcqRel);
-        i32::try_from(index).unwrap_or_default()
-    })
+    // Terminal lifecycle signals take precedence over repaint/capture traffic. Clear exactly one
+    // bit with an atomic RMW so concurrently arriving signals cannot be lost.
+    for signal in [
+        signal_hook::consts::SIGTSTP,
+        signal_hook::consts::SIGCONT,
+        signal_hook::consts::SIGWINCH,
+        signal_hook::consts::SIGUSR1,
+    ] {
+        let bit = 1_u64 << u32::try_from(signal).unwrap_or_default();
+        let previous = pending.fetch_and(!bit, Ordering::AcqRel);
+        if previous & bit != 0 {
+            return Some(signal);
+        }
+    }
+    None
 }
 
 use crate::{
@@ -54,6 +63,7 @@ use crate::{
 struct ChildCleanup {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     armed: bool,
+    signal_forwarding: Arc<Mutex<bool>>,
 }
 
 struct ThreadCleanup {
@@ -81,13 +91,24 @@ impl Drop for ThreadCleanup {
 }
 
 impl ChildCleanup {
-    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
-        Self { child, armed: true }
+    fn new(
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        signal_forwarding: Arc<Mutex<bool>>,
+    ) -> Self {
+        Self {
+            child,
+            armed: true,
+            signal_forwarding,
+        }
     }
 }
 
 impl Drop for ChildCleanup {
     fn drop(&mut self) {
+        *self
+            .signal_forwarding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
         if self.armed {
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -215,14 +236,29 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
         }
     });
 
-    // Signals use an independent coalescing bitset: PTY output backpressure can neither block nor
-    // consume a termination request, while a signal storm cannot grow memory.
+    let child_pid = spawned_child
+        .process_id()
+        .and_then(|pid| i32::try_from(pid).ok());
+    let child_pgid = pair
+        .master
+        .process_group_leader()
+        .filter(|pgid| *pgid > 0)
+        .or(child_pid);
+    // portable-pty starts the child as its process-group leader. Before the first successful
+    // foreground probe, the child's pid is the only group we can safely claim is ours; the PTY
+    // driver's cached foreground value can still describe the parent during startup.
+    let foreground_pgid = Arc::new(AtomicI32::new(child_pid.or(child_pgid).unwrap_or_default()));
+    let foreground_fd = pair.master.as_raw_fd();
+
+    // Terminal lifecycle signals use a bounded coalescing bitset. Termination signals are
+    // forwarded by this independent thread so a blocked stdout can never stall delivery.
     let pending_signals = Arc::new(AtomicU64::new(0));
     let signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGWINCH,
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGQUIT,
         signal_hook::consts::SIGTSTP,
         signal_hook::consts::SIGCONT,
         signal_hook::consts::SIGUSR1,
@@ -240,8 +276,40 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     };
     let signal_handle = signals.handle();
     let signal_pending = Arc::clone(&pending_signals);
+    let signal_foreground = Arc::clone(&foreground_pgid);
+    let signal_forwarding = Arc::new(Mutex::new(true));
+    let thread_signal_forwarding = Arc::clone(&signal_forwarding);
     let signal_thread = thread::spawn(move || {
         for signal in signals.forever() {
+            if matches!(
+                signal,
+                signal_hook::consts::SIGINT
+                    | signal_hook::consts::SIGTERM
+                    | signal_hook::consts::SIGHUP
+                    | signal_hook::consts::SIGQUIT
+            ) {
+                let forwarding = thread_signal_forwarding
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !*forwarding {
+                    continue;
+                }
+                let cached = signal_foreground.load(Ordering::Acquire);
+                let current = child_pid
+                    .and_then(|pid| crate::platform::foreground_pgid(pid, foreground_fd))
+                    .or((cached > 0).then_some(cached));
+                if let Some(current) = current {
+                    signal_foreground.store(current, Ordering::Release);
+                }
+                let _ = forward_signal_with_retry(
+                    current,
+                    None,
+                    child_pid.or(child_pgid),
+                    signal,
+                    crate::platform::forward_signal,
+                );
+                continue;
+            }
             if let Ok(index) = u32::try_from(signal)
                 && index < u64::BITS
             {
@@ -257,7 +325,7 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
         signal: Some(signal_thread),
     };
     // Declared after the thread guard so failure unwinding kills the child before joining readers.
-    let mut child = ChildCleanup::new(spawned_child);
+    let mut child = ChildCleanup::new(spawned_child, Arc::clone(&signal_forwarding));
 
     // The main loop is the sole output owner: child bytes are flushed before parsing.
     let mut screen = Screen::new(initial_size.rows, initial_size.cols);
@@ -266,15 +334,6 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     let mut sink = options.events.clone().map(Sink::connect);
     let mut queued = Vec::<Vec<u8>>::new();
     let mut stdout = io::stdout().lock();
-    let child_pid = child
-        .child
-        .process_id()
-        .and_then(|pid| i32::try_from(pid).ok());
-    let child_pgid = pair
-        .master
-        .process_group_leader()
-        .filter(|pgid| *pgid > 0)
-        .or(child_pid);
     let command_name = std::path::Path::new(command)
         .file_name()
         .and_then(|value| value.to_str());
@@ -439,6 +498,10 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
             let no_pgid_full = scheduler.pgid_presence(pgid.is_some(), now);
             let changed = pgid != last_pgid;
             last_pgid = pgid;
+            foreground_pgid.store(
+                pgid.unwrap_or(child_pid.or(child_pgid).unwrap_or_default()),
+                Ordering::Release,
+            );
             let full =
                 scheduler.completed(now, active_agent.is_some(), machine.hold_pending(), changed);
             if full || no_pgid_full {
@@ -513,6 +576,9 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
             }
         }
     }
+    *signal_forwarding
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
     let status = restore_on_error(
         child.child.wait().context("wait for wrapped command"),
         &titles,
@@ -855,8 +921,18 @@ mod signal_tests {
         let (output_tx, _output_rx) = std::sync::mpsc::sync_channel(1);
         output_tx.send(1_u8).expect("fill output");
         let signals = std::sync::atomic::AtomicU64::new(0);
-        signals.fetch_or(1 << 15, std::sync::atomic::Ordering::Release);
-        assert_eq!(take_pending_signal(&signals), Some(15));
+        signals.fetch_or(
+            (1 << signal_hook::consts::SIGUSR1) | (1 << signal_hook::consts::SIGWINCH),
+            std::sync::atomic::Ordering::Release,
+        );
+        assert_eq!(
+            take_pending_signal(&signals),
+            Some(signal_hook::consts::SIGWINCH)
+        );
+        assert_eq!(
+            take_pending_signal(&signals),
+            Some(signal_hook::consts::SIGUSR1)
+        );
         assert_eq!(take_pending_signal(&signals), None);
 
         use std::os::unix::fs::PermissionsExt as _;

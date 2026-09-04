@@ -1,8 +1,11 @@
 #![allow(clippy::indexing_slicing)]
 
 use std::{
+    fs,
     io::{BufRead, BufReader, Read, Write},
     process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 #[test]
@@ -193,5 +196,53 @@ fn wrapper_signal_reaches_the_foreground_child_group() -> Result<(), Box<dyn std
         .status()?;
     assert!(kill.success());
     assert_eq!(child.wait()?.code(), Some(23));
+    Ok(())
+}
+
+#[test]
+fn termination_reaches_child_while_wrapper_stdout_pipe_is_full()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = std::env::temp_dir().join(format!("zor-signal-pressure-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root)?;
+    let marker = root.join("delivered");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zor"))
+        .args([
+            "--title",
+            "never",
+            "--",
+            "/usr/bin/perl",
+            "-e",
+            "$p=shift; $SIG{TERM}=sub { open(my $f, '>', $p); print $f 'ok'; close($f); exit 0 }; $|=1; print \"READY\\n\"; while (1) { print 'x' x 8192 }",
+            marker.to_str().ok_or("non-utf8 marker")?,
+        ])
+        .env("PERL_SIGNALS", "unsafe")
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or("missing stdout")?;
+    let mut stdout = BufReader::new(stdout);
+    let mut ready = String::new();
+    stdout.read_line(&mut ready)?;
+    assert_eq!(ready.trim(), "READY");
+    thread::sleep(Duration::from_millis(700));
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()?
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        marker.exists(),
+        "child did not receive TERM while stdout was backpressured"
+    );
+    // Drain the pipe so the coordinator can observe EOF and finish teardown.
+    let mut output = Vec::new();
+    stdout.read_to_end(&mut output)?;
+    assert!(child.wait()?.success());
+    fs::remove_dir_all(root)?;
     Ok(())
 }
