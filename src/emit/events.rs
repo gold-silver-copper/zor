@@ -144,4 +144,29 @@ mod tests {
         assert_eq!(encoded.last(), Some(&b'\n'));
         assert!(serde_json::from_slice::<serde_json::Value>(&encoded).is_ok());
     }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn full_socket_drops_instead_of_blocking() {
+        // Phase Z §6: a nonblocking full sink increments the drop counter.
+        let (writer, _reader) =
+            UnixStream::pair().unwrap_or_else(|error| panic!("socket pair: {error}"));
+        writer
+            .set_nonblocking(true)
+            .unwrap_or_else(|error| panic!("nonblocking: {error}"));
+        let mut sink = Sink {
+            path: PathBuf::new(),
+            target: Some(Target::Socket(writer)),
+            retry_at: Instant::now(),
+            dropped: 0,
+        };
+        let line = vec![b'x'; 65_536];
+        for _ in 0..1024 {
+            sink.write(&line);
+            if sink.dropped > 0 {
+                break;
+            }
+        }
+        assert!(sink.dropped > 0);
+    }
 }

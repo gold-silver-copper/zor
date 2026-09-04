@@ -149,3 +149,9 @@ pub fn forward_signal(pgid: Pid, signal: i32) -> io::Result<()> {
         }
     }
 }
+pub fn suspend_self() {
+    unsafe {
+        // SAFETY: SIGSTOP has defined process-wide semantics and no handler.
+        libc::raise(libc::SIGSTOP);
+    }
+}

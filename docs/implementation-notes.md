@@ -17,3 +17,9 @@ vt100 0.16.2 on 2026-09-03.
   flushes each chunk before parsing it and before any future injected bytes.
 - No genuine Claude Code panes were available. `rules/claude.toml.draft` is intentionally not
   registered as a bundle and `zor agents` reports that there are no bundled sets.
+- The raw-mode restoration test is ignored by default because it deliberately changes fd 0 and
+  requires an interactive controlling terminal; run it manually with
+  `cargo test raw_guard_restores_terminal_attributes -- --ignored` from a disposable terminal.
+- This implementation session ran on macOS without an installed Linux Rust target. Linux-specific
+  `/proc` code therefore requires the Ubuntu CI job for native compilation and process-tree
+  integration; only the target-independent scheduler/loss seams ran locally.

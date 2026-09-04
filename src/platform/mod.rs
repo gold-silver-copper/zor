@@ -24,6 +24,10 @@ mod linux;
 mod macos;
 
 #[cfg(target_os = "linux")]
-pub use linux::{Guard, foreground_pgid, forward_signal, job, leader, set_raw, winsize};
+pub use linux::{
+    Guard, foreground_pgid, forward_signal, job, leader, set_raw, suspend_self, winsize,
+};
 #[cfg(target_os = "macos")]
-pub use macos::{Guard, foreground_pgid, forward_signal, job, leader, set_raw, winsize};
+pub use macos::{
+    Guard, foreground_pgid, forward_signal, job, leader, set_raw, suspend_self, winsize,
+};

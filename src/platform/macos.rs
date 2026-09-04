@@ -177,3 +177,31 @@ pub fn forward_signal(pgid: Pid, signal: i32) -> io::Result<()> {
         }
     }
 }
+pub fn suspend_self() {
+    unsafe {
+        // SAFETY: SIGSTOP has defined process-wide semantics and no handler.
+        libc::raise(libc::SIGSTOP);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires an interactive controlling tty"]
+    fn raw_guard_restores_terminal_attributes() {
+        // Phase Z §4: raw mode is restored when its guard drops.
+        let fd = 0;
+        unsafe {
+            // SAFETY: fd belongs to the live PTY and termios buffers are initialized.
+            let mut before: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(fd, &mut before), 0);
+            let Ok(guard) = set_raw(fd) else { return };
+            drop(guard);
+            let mut after: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(fd, &mut after), 0);
+            assert_eq!(before.c_lflag, after.c_lflag);
+            assert_eq!(before.c_iflag, after.c_iflag);
+        }
+    }
+}

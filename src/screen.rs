@@ -10,6 +10,7 @@ struct Callbacks {
     bells: u64,
     progress: Option<Progress>,
     event: bool,
+    observed_reports: Vec<Vec<u8>>,
 }
 
 impl vt100::Callbacks for Callbacks {
@@ -28,6 +29,12 @@ impl vt100::Callbacks for Callbacks {
     }
 
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if params
+            .first()
+            .is_some_and(|value| matches!(*value, b"7877" | b"21337"))
+        {
+            self.observed_reports.push(params.to_vec().join(&b';'));
+        }
         if params.first().copied() != Some(b"9") || params.get(1).copied() != Some(b"4") {
             return;
         }
@@ -203,6 +210,9 @@ impl Screen {
     }
     pub fn clear_changed(&mut self) {
         self.changed = false;
+    }
+    pub fn take_observed_reports(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.parser.callbacks_mut().observed_reports)
     }
     #[must_use]
     pub fn bell_count(&self) -> u64 {

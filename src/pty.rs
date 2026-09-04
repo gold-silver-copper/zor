@@ -29,7 +29,7 @@ pub struct Options {
 pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     let system = NativePtySystem::default();
     let initial_size = crate::platform::winsize(0);
-    let _raw_guard = crate::platform::set_raw(0).ok();
+    let mut raw_guard = crate::platform::set_raw(0).ok();
     let pair = system.openpty(initial_size).context("open pty")?;
     let mut builder = CommandBuilder::new(command);
     builder.args(argv);
@@ -103,6 +103,7 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     let mut active_agent = options.agent.clone();
     let mut scheduler = crate::platform::probe::Scheduler::new(std::time::Instant::now());
     let mut last_pgid = None;
+    let mut loss_tracker = crate::platform::probe::LossTracker::new();
     let mut last_title = String::new();
     loop {
         let message = output_rx.recv_timeout(std::time::Duration::from_millis(50));
@@ -116,6 +117,20 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                     screen.resize(size.rows, size.cols);
                 } else if signal == signal_hook::consts::SIGUSR1 {
                     write_fixture(&screen, options.agent.as_ref());
+                } else if signal == signal_hook::consts::SIGTSTP {
+                    if let Some(pid) = child_pid {
+                        let _ = crate::platform::forward_signal(pid, signal);
+                    }
+                    drop(raw_guard.take());
+                    crate::platform::suspend_self();
+                    raw_guard = crate::platform::set_raw(0).ok();
+                } else if signal == signal_hook::consts::SIGCONT {
+                    if raw_guard.is_none() {
+                        raw_guard = crate::platform::set_raw(0).ok();
+                    }
+                    if let Some(pid) = child_pid {
+                        let _ = crate::platform::forward_signal(pid, signal);
+                    }
                 } else if let Some(pid) = child_pid {
                     let _ = crate::platform::forward_signal(pid, signal);
                 }
@@ -128,6 +143,14 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
             stdout.write_all(&chunk).context("write child output")?;
             stdout.flush().context("flush child output")?;
             let _ = screen.process(&chunk);
+            for payload in screen.take_observed_reports() {
+                if options.debug {
+                    eprintln!(
+                        "zor: observed child OSC {}",
+                        String::from_utf8_lossy(&payload)
+                    );
+                }
+            }
             if screen.title() != last_title {
                 last_title = screen.title().to_owned();
                 let (state, _, _) = machine.current();
@@ -140,6 +163,9 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                 }
             }
             if screen.changed() {
+                if active_agent.is_none() {
+                    scheduler.screen_changed_without_agent(std::time::Instant::now());
+                }
                 let verdict = active_agent
                     .as_ref()
                     .and_then(|id| options.rule_sets.iter().find(|set| set.id == id.as_str()))
@@ -173,6 +199,7 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
             && let Some(pid) = child_pid
         {
             let pgid = crate::platform::foreground_pgid(pid);
+            let no_pgid_full = scheduler.pgid_presence(pgid.is_some(), now);
             let changed = pgid != last_pgid;
             last_pgid = pgid;
             let full = scheduler.completed(
@@ -181,19 +208,27 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                 machine.next_deadline().is_some(),
                 changed,
             );
-            if full {
-                let detected = pgid.and_then(|group| {
-                    let direct =
-                        crate::platform::leader(group).map(|process| crate::platform::Job {
-                            leader: group,
-                            processes: vec![process],
-                        });
-                    let listed = direct.unwrap_or_else(|| crate::platform::job(pid, group));
-                    crate::rules::ident::identify(&listed, &options.rule_sets).map(|(id, _)| id)
-                });
-                if detected != active_agent {
-                    active_agent = detected;
-                    let events = machine.observe(None, active_agent.clone(), child_pid, false, now);
+            if full || no_pgid_full {
+                let listed = pgid.map_or_else(
+                    || crate::platform::Job {
+                        leader: 0,
+                        processes: Vec::new(),
+                    },
+                    |group| crate::platform::job(pid, group),
+                );
+                let detected = crate::rules::ident::identify(&listed, &options.rule_sets);
+                let shell = listed.processes.iter().any(|process| process.pid == pid);
+                if let Some(outcome) = loss_tracker.update(detected, shell) {
+                    let (next, exited) = match outcome {
+                        crate::platform::probe::Detection::AgentFound { id, .. } => {
+                            (Some(id), false)
+                        }
+                        crate::platform::probe::Detection::Exited { agent } => (Some(agent), true),
+                        crate::platform::probe::Detection::AgentLost => (None, false),
+                    };
+                    active_agent = next;
+                    let events =
+                        machine.observe(None, active_agent.clone(), child_pid, exited, now);
                     queue_events(
                         &events,
                         &options,

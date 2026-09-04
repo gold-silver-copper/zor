@@ -1,9 +1,81 @@
+use crate::osc::AgentId;
 use std::time::{Duration, Instant};
 
 pub struct Scheduler {
     next: Instant,
     last_full: Option<Instant>,
     acquisition: Option<Instant>,
+    no_pgid_since: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Detection {
+    AgentFound { id: AgentId, pid: i32 },
+    Exited { agent: AgentId },
+    AgentLost,
+}
+
+pub struct LossTracker {
+    current: Option<(AgentId, i32)>,
+    misses: u8,
+    exit_announced: bool,
+}
+impl LossTracker {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            current: None,
+            misses: 0,
+            exit_announced: false,
+        }
+    }
+    pub fn update(
+        &mut self,
+        detected: Option<(AgentId, i32)>,
+        shell_in_foreground: bool,
+    ) -> Option<Detection> {
+        if let Some(found) = detected {
+            self.misses = 0;
+            self.exit_announced = false;
+            if self.current.as_ref() != Some(&found) {
+                self.current = Some(found.clone());
+                return Some(Detection::AgentFound {
+                    id: found.0,
+                    pid: found.1,
+                });
+            }
+            return None;
+        }
+        let (id, _) = self.current.clone()?;
+        if shell_in_foreground {
+            if !self.exit_announced {
+                self.exit_announced = true;
+                return Some(Detection::Exited { agent: id });
+            }
+            self.current = None;
+            self.exit_announced = false;
+            self.misses = 0;
+            return Some(Detection::AgentLost);
+        }
+        self.exit_announced = false;
+        self.misses = self.misses.saturating_add(1);
+        if self.misses >= 6 {
+            self.current = None;
+            self.misses = 0;
+            Some(Detection::AgentLost)
+        } else {
+            None
+        }
+    }
+    #[must_use]
+    pub fn current(&self) -> Option<&(AgentId, i32)> {
+        self.current.as_ref()
+    }
+}
+impl Default for LossTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Scheduler {
@@ -13,6 +85,7 @@ impl Scheduler {
             next: now,
             last_full: None,
             acquisition: None,
+            no_pgid_since: None,
         }
     }
     pub fn screen_changed_without_agent(&mut self, now: Instant) {
@@ -59,6 +132,14 @@ impl Scheduler {
         self.next = now + cadence;
         full
     }
+    pub fn pgid_presence(&mut self, present: bool, now: Instant) -> bool {
+        if present {
+            self.no_pgid_since = None;
+            return false;
+        }
+        let opened = *self.no_pgid_since.get_or_insert(now);
+        now.duration_since(opened) >= Duration::from_secs(30)
+    }
 }
 
 #[cfg(test)]
@@ -76,5 +157,31 @@ mod tests {
         let later = now + Duration::from_secs(1);
         let _ = scheduler.completed(later, true, false, false);
         assert!(scheduler.due(later + Duration::from_millis(300)));
+        assert!(!scheduler.pgid_presence(false, later));
+        assert!(scheduler.pgid_presence(false, later + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn loss_tracker_distinguishes_exit_from_six_foreign_misses() {
+        // Phase Z §4: shell return announces exit then loss; foreign jobs require six misses.
+        let id = AgentId::new("agent").ok();
+        let mut tracker = LossTracker::new();
+        assert!(matches!(
+            tracker.update(id.clone().map(|id| (id, 2)), false),
+            Some(Detection::AgentFound { .. })
+        ));
+        assert!(matches!(
+            tracker.update(None, true),
+            Some(Detection::Exited { .. })
+        ));
+        assert_eq!(tracker.update(None, true), Some(Detection::AgentLost));
+        assert!(matches!(
+            tracker.update(id.map(|id| (id, 3)), false),
+            Some(Detection::AgentFound { .. })
+        ));
+        for _ in 0..5 {
+            assert_eq!(tracker.update(None, false), None);
+        }
+        assert_eq!(tracker.update(None, false), Some(Detection::AgentLost));
     }
 }
