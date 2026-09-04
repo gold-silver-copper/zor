@@ -68,6 +68,8 @@ pub fn timestamp() -> f64 {
 enum Target {
     Socket(UnixStream),
     File(File),
+    #[cfg(test)]
+    Test(Box<dyn Write + Send>),
 }
 pub struct Sink {
     path: PathBuf,
@@ -91,19 +93,18 @@ impl Sink {
             self.reconnect();
         }
         let result = match self.target.as_mut() {
-            Some(Target::Socket(value)) => value.write_all(line),
-            Some(Target::File(value)) => value.write_all(line),
+            Some(Target::Socket(value)) => value.write(line),
+            Some(Target::File(value)) => value.write(line),
+            #[cfg(test)]
+            Some(Target::Test(value)) => value.write(line),
             None => return,
         };
-        if let Err(error) = result {
+        if !matches!(result, Ok(written) if written == line.len()) {
             self.dropped = self.dropped.saturating_add(1);
-            if matches!(
-                error.kind(),
-                io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
-            ) {
-                self.target = None;
-                self.retry_at = Instant::now() + Duration::from_secs(1);
-            }
+            // A partial JSON line cannot safely share a stream with a later record. Closing the
+            // target gives socket readers an EOF boundary at which to discard the fragment.
+            self.target = None;
+            self.retry_at = Instant::now() + Duration::from_secs(1);
         }
     }
     fn reconnect(&mut self) {
@@ -143,6 +144,23 @@ fn open_target(path: &Path) -> io::Result<Target> {
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct PartialWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Write for PartialWriter {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            let count = input.len().min(3);
+            if let Ok(mut bytes) = self.bytes.lock() {
+                bytes.extend_from_slice(input.get(..count).unwrap_or_default());
+            }
+            Ok(count)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
     #[test]
     fn event_is_one_json_line() {
         // Phase Z §6: event output is parseable JSON Lines with optional fields omitted.
@@ -217,5 +235,27 @@ mod tests {
             }
         }
         assert!(sink.dropped > 0);
+    }
+
+    #[test]
+    fn partial_write_closes_the_target_before_another_json_line() {
+        // Phase Z §6: a short nonblocking write cannot prefix-corrupt a later JSON record.
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = Sink {
+            path: PathBuf::new(),
+            target: Some(Target::Test(Box::new(PartialWriter {
+                bytes: Arc::clone(&bytes),
+            }))),
+            retry_at: Instant::now(),
+            dropped: 0,
+        };
+        sink.write(b"{\"one\":1}\n");
+        sink.write(b"{\"two\":2}\n");
+        assert_eq!(sink.dropped, 1);
+        assert!(sink.target.is_none());
+        assert_eq!(
+            bytes.lock().map(|value| value.clone()).unwrap_or_default(),
+            b"{\"o"
+        );
     }
 }

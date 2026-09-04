@@ -1,7 +1,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     process::{Command, Stdio},
 };
 
@@ -160,5 +160,38 @@ fn nested_wrapper_uses_transparent_execution() -> Result<(), Box<dyn std::error:
         .output()?;
     assert_eq!(output.stdout, b"nested");
     assert_eq!(output.status.code(), Some(9));
+    let output = Command::new(env!("CARGO_BIN_EXE_zor"))
+        .env("ZOR_PID", "1")
+        .args(["--", "/bin/sh", "-c", "kill -TERM $$"])
+        .output()?;
+    assert_eq!(output.status.code(), Some(143));
+    Ok(())
+}
+
+#[test]
+fn wrapper_signal_reaches_the_foreground_child_group() -> Result<(), Box<dyn std::error::Error>> {
+    // Phase Z §4-5: termination targets the detected foreground process group.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zor"))
+        .args([
+            "--title",
+            "never",
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap 'exit 23' TERM; echo READY; while :; do sleep 1; done",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or("missing stdout")?;
+    let mut stdout = BufReader::new(stdout);
+    let mut ready = String::new();
+    stdout.read_line(&mut ready)?;
+    assert_eq!(ready.trim(), "READY");
+    std::thread::sleep(std::time::Duration::from_millis(650));
+    let kill = Command::new("/bin/kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()?;
+    assert!(kill.success());
+    assert_eq!(child.wait()?.code(), Some(23));
     Ok(())
 }

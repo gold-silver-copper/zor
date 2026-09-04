@@ -212,6 +212,11 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
         .child
         .process_id()
         .and_then(|pid| i32::try_from(pid).ok());
+    let child_pgid = pair
+        .master
+        .process_group_leader()
+        .filter(|pgid| *pgid > 0)
+        .or(child_pid);
     let command_name = std::path::Path::new(command)
         .file_name()
         .and_then(|value| value.to_str());
@@ -245,8 +250,8 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                 } else if signal == signal_hook::consts::SIGUSR1 {
                     write_fixture(&screen, options.agent.as_ref());
                 } else if signal == signal_hook::consts::SIGTSTP {
-                    if let Some(pid) = child_pid {
-                        let _ = crate::platform::forward_signal(pid, signal);
+                    if let Some(pgid) = signal_target(last_pgid, child_pgid) {
+                        let _ = crate::platform::forward_signal(pgid, signal);
                     }
                     drop(raw_guard.take());
                     crate::platform::suspend_self();
@@ -255,11 +260,11 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
                     if raw_guard.is_none() {
                         raw_guard = crate::platform::set_raw(0).ok();
                     }
-                    if let Some(pid) = child_pid {
-                        let _ = crate::platform::forward_signal(pid, signal);
+                    if let Some(pgid) = signal_target(last_pgid, child_pgid) {
+                        let _ = crate::platform::forward_signal(pgid, signal);
                     }
-                } else if let Some(pid) = child_pid {
-                    let _ = crate::platform::forward_signal(pid, signal);
+                } else if let Some(pgid) = signal_target(last_pgid, child_pgid) {
+                    let _ = crate::platform::forward_signal(pgid, signal);
                 }
                 None
             }
@@ -466,6 +471,12 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     Ok(u8::try_from(code).unwrap_or(u8::MAX))
 }
 
+fn signal_target(foreground_pgid: Option<i32>, child_pgid: Option<i32>) -> Option<i32> {
+    foreground_pgid
+        .filter(|pgid| *pgid > 0)
+        .or_else(|| child_pgid.filter(|pgid| *pgid > 0))
+}
+
 fn restore_on_error<T>(result: Result<T>, titles: &Titles, stdout: &mut impl Write) -> Result<T> {
     if result.is_err()
         && let Some(bytes) = titles.restore()
@@ -667,12 +678,26 @@ fn observation(verdict: &crate::rules::Verdict) -> crate::state::Observation {
 }
 
 pub fn run_transparent(command: &str, argv: &[String]) -> Result<u8> {
+    use std::os::unix::process::ExitStatusExt;
     let status = std::process::Command::new(command)
         .args(argv)
         .status()
         .context("run nested wrapped command")?;
-    Ok(status
+    let code = status
         .code()
-        .and_then(|code| u8::try_from(code).ok())
-        .unwrap_or(1))
+        .unwrap_or_else(|| 128_i32.saturating_add(status.signal().unwrap_or_default()));
+    Ok(u8::try_from(code).unwrap_or(u8::MAX))
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::signal_target;
+
+    #[test]
+    fn foreground_process_group_precedes_validated_child_fallback() {
+        // Phase Z §4-5: forwarded signals follow the active foreground job when known.
+        assert_eq!(signal_target(Some(42), Some(7)), Some(42));
+        assert_eq!(signal_target(None, Some(7)), Some(7));
+        assert_eq!(signal_target(Some(0), Some(-1)), None);
+    }
 }
