@@ -612,6 +612,7 @@ pub fn run(command: &str, argv: &[String], options: Options) -> Result<u8> {
     if let Some(target) = &mut sink {
         let time = timestamp();
         if let Ok(bytes) = encode(&ExitLine {
+            v: crate::osc::PROTOCOL_VERSION,
             t: "exit",
             code,
             ts: time,
@@ -830,6 +831,7 @@ fn write_event_line(
     .filter_map(|(set, name)| set.then_some(name))
     .collect();
     let line = EventLine {
+        v: crate::osc::PROTOCOL_VERSION,
         t: "state",
         ts: time,
         state: state_name(state),
@@ -855,6 +857,7 @@ fn write_agent_event(
     let Some(target) = sink else { return };
     let time = timestamp();
     let line = AgentLine {
+        v: crate::osc::PROTOCOL_VERSION,
         t: "agent",
         agent: agent.map(crate::osc::AgentId::as_str),
         pid,

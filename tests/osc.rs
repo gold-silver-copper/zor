@@ -30,7 +30,7 @@ fn every_state_and_flag_combination_round_trips() {
 #[test]
 fn complete_bel_frames_and_unknown_keys_are_accepted() {
     // Phase 0 OSC contract: complete frames are convenient and extensions are forward-compatible.
-    let input = b"\x1b]7877;state=idle;future=yes;agent=codex;seq=7;visible=;exited=0\x07";
+    let input = b"\x1b]7877;v=1;state=idle;future=yes;agent=codex;seq=7;visible=;exited=0\x07";
     assert_eq!(parse(input).expect("valid report").state(), State::Idle);
 }
 
@@ -38,23 +38,23 @@ fn complete_bel_frames_and_unknown_keys_are_accepted() {
 fn malformed_contract_inputs_are_rejected() {
     // Phase 0 OSC contract: malformed and ambiguous reports fail closed.
     let cases: &[&[u8]] = &[
-        b"7877;agent=x;seq=1",
-        b"7877;state=idle;agent=x",
-        b"7877;state=mystery;agent=x;seq=1",
-        b"7877;state=idle;agent=x;seq=1;seq=2",
-        b"7877;state=idle;agent=x;seq=1;visible=nope",
-        b"7877;state=idle;agent=x;seq=1;message=%GG",
-        b"7877;state=idle;agent=bad space;seq=1",
-        b"7877;state=none;agent=x;seq=1",
-        b"7877;state=idle;seq=1",
-        b"\x1b]7877;state=none;seq=1\x1b\\junk",
-        b"7877;state=none;seq=1\x07junk",
-        b"7877;state=none;seq=1;message=%FF",
+        b"7877;v=1;agent=x;seq=1",
+        b"7877;v=1;state=idle;agent=x",
+        b"7877;v=1;state=mystery;agent=x;seq=1",
+        b"7877;v=1;state=idle;agent=x;seq=1;seq=2",
+        b"7877;v=1;state=idle;agent=x;seq=1;visible=nope",
+        b"7877;v=1;state=idle;agent=x;seq=1;message=%GG",
+        b"7877;v=1;state=idle;agent=bad space;seq=1",
+        b"7877;v=1;state=none;agent=x;seq=1",
+        b"7877;v=1;state=idle;seq=1",
+        b"\x1b]7877;v=1;state=none;seq=1\x1b\\junk",
+        b"7877;v=1;state=none;seq=1\x07junk",
+        b"7877;v=1;state=none;seq=1;message=%FF",
     ];
     for input in cases {
         assert!(parse(input).is_err(), "accepted {input:?}");
     }
-    let long = format!("7877;state=none;seq=1;message={}", "x".repeat(129));
+    let long = format!("7877;v=1;state=none;seq=1;message={}", "x".repeat(129));
     assert!(parse(long.as_bytes()).is_err());
 }
 
@@ -93,4 +93,19 @@ proptest! {
         // Phase 0 OSC totality: arbitrary bytes return a value or an error without panicking.
         let _ = parse(&input);
     }
+}
+
+#[test]
+fn report_version_and_total_encoded_size_are_enforced() {
+    assert!(parse(b"7877;state=none;seq=1").is_err());
+    assert!(parse(b"7877;v=2;state=none;seq=1").is_err());
+    assert!(parse(b"7877;v=1;v=1;state=none;seq=1").is_err());
+    let oversized = format!(
+        "7877;v=1;state=none;seq=1;future={}",
+        "x".repeat(zor::osc::MAX_REPORT_BYTES)
+    );
+    assert!(parse(oversized.as_bytes()).is_err());
+    let encoded = format(&report(State::Idle, Flags::default()));
+    assert!(encoded.len() <= zor::osc::MAX_REPORT_BYTES);
+    assert_eq!(zor::osc::PROTOCOL_VERSION, 1);
 }

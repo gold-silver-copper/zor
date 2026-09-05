@@ -12,6 +12,7 @@ use std::{
 
 #[derive(Serialize)]
 pub struct EventLine<'a> {
+    pub v: u16,
     pub t: &'a str,
     pub ts: f64,
     pub state: &'a str,
@@ -34,6 +35,7 @@ pub struct EventLine<'a> {
 
 #[derive(Serialize)]
 pub struct AgentLine<'a> {
+    pub v: u16,
     pub t: &'static str,
     pub agent: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,6 +45,7 @@ pub struct AgentLine<'a> {
 
 #[derive(Serialize)]
 pub struct ExitLine {
+    pub v: u16,
     pub t: &'static str,
     pub code: i32,
     pub ts: f64,
@@ -54,6 +57,11 @@ fn is_false(value: &bool) -> bool {
 pub fn encode(event: &impl Serialize) -> Result<Vec<u8>, serde_json::Error> {
     let mut line = serde_json::to_vec(event)?;
     line.push(b'\n');
+    if line.len() > MAX_EVENT_BYTES {
+        return Err(<serde_json::Error as serde::ser::Error>::custom(
+            "observation event exceeds 2048 bytes",
+        ));
+    }
     Ok(line)
 }
 
@@ -71,7 +79,8 @@ enum Target {
     #[cfg(test)]
     Test(Box<dyn Write + Send>),
 }
-const MAX_PENDING_RECORD: usize = 2_048;
+pub const MAX_EVENT_BYTES: usize = 2_048;
+const MAX_PENDING_RECORD: usize = MAX_EVENT_BYTES;
 
 struct Pending {
     bytes: Vec<u8>,
@@ -212,6 +221,7 @@ mod tests {
     fn event_is_one_json_line() {
         // Phase Z §6: event output is parseable JSON Lines with optional fields omitted.
         let line = EventLine {
+            v: crate::osc::PROTOCOL_VERSION,
             t: "state",
             ts: 1.0,
             state: "idle",
@@ -227,6 +237,7 @@ mod tests {
         let encoded = encode(&line).unwrap_or_default();
         assert_eq!(encoded.last(), Some(&b'\n'));
         let value = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap_or_default();
+        assert_eq!(value["v"], crate::osc::PROTOCOL_VERSION);
         assert_eq!(value["t"], "state");
         assert_eq!(value["ts"], 1.0);
         assert_eq!(value["state"], "idle");
@@ -237,6 +248,7 @@ mod tests {
     fn agent_and_exit_lines_use_the_tagged_contract() {
         // Phase Z §6: lifecycle lines carry their type, timestamp, and relevant payload.
         let agent = encode(&AgentLine {
+            v: crate::osc::PROTOCOL_VERSION,
             t: "agent",
             agent: Some("claude"),
             pid: Some(42),
@@ -244,6 +256,7 @@ mod tests {
         })
         .unwrap_or_default();
         let exit = encode(&ExitLine {
+            v: crate::osc::PROTOCOL_VERSION,
             t: "exit",
             code: 143,
             ts: 3.0,

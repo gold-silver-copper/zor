@@ -45,6 +45,8 @@ See `DESIGN.md` for the architecture and full protocol contract.
 zor = { version = "=0.1.0", default-features = false }
 ```
 
+The versioned wire and trust contract is documented in [OBSERVATION-CONTRACT.md](OBSERVATION-CONTRACT.md).
+
 The protocol-only surface is `zor::osc::{AgentId, Flags, Report, State, format, parse}`.
 
 ## License

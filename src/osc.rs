@@ -2,6 +2,11 @@
 
 use std::fmt;
 
+/// OSC and JSON-lines observation schema version. Reports are unverified terminal observations,
+/// not authenticated statements about the process that emitted them.
+pub const PROTOCOL_VERSION: u16 = 1;
+/// Maximum encoded OSC report size, including optional framing and unknown extension fields.
+pub const MAX_REPORT_BYTES: usize = 1024;
 const CODE: &[u8] = b"7877";
 const MAX_AGENT_BYTES: usize = 64;
 const MAX_MESSAGE_BYTES: usize = 128;
@@ -119,7 +124,7 @@ impl std::error::Error for Error {}
 
 #[must_use]
 pub fn format(report: &Report) -> Vec<u8> {
-    let mut output = format!("\u{1b}]7877;state={};", state_name(report.state));
+    let mut output = format!("\u{1b}]7877;v=1;state={};", state_name(report.state));
     if let Some(agent) = &report.agent {
         output.push_str("agent=");
         output.push_str(agent.as_str());
@@ -149,12 +154,16 @@ pub fn format(report: &Report) -> Vec<u8> {
 }
 
 pub fn parse(input: &[u8]) -> Result<Report, Error> {
+    if input.len() > MAX_REPORT_BYTES {
+        return Err(Error);
+    }
     let payload = strip_frame(input)?;
     let mut fields = payload.split(|byte| *byte == b';');
     if fields.next() != Some(CODE) {
         return Err(Error);
     }
 
+    let mut version = None;
     let mut state = None;
     let mut agent = None;
     let mut seq = None;
@@ -172,6 +181,8 @@ pub fn parse(input: &[u8]) -> Result<Report, Error> {
             return Err(Error);
         };
         match key {
+            b"v" if version.is_none() && value == b"1" => version = Some(PROTOCOL_VERSION),
+            b"v" => return Err(Error),
             b"state" if state.is_none() => state = Some(parse_state(value)?),
             b"agent" if agent.is_none() => {
                 let decoded = std::str::from_utf8(value).map_err(|_| Error)?;
@@ -198,6 +209,9 @@ pub fn parse(input: &[u8]) -> Result<Report, Error> {
             }
             _ => {}
         }
+    }
+    if version != Some(PROTOCOL_VERSION) {
+        return Err(Error);
     }
     Report::new(
         state.ok_or(Error)?,

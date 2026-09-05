@@ -490,7 +490,7 @@ mod tests {
     fn valid_split_agent_osc_remains_observable_below_the_limit() {
         let mut screen = Screen::new(4, 20);
         for chunk in [
-            b"\x1b]7877;state=blocked;agent=a;".as_slice(),
+            b"\x1b]7877;v=1;state=blocked;agent=a;".as_slice(),
             b"seq=1;visible=blocker;exited=0\x1b",
             b"\\",
         ] {

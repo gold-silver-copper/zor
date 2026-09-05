@@ -294,7 +294,11 @@ fn termination_reaches_child_while_wrapper_stdout_pipe_is_full()
     // Drain the pipe so the coordinator can observe EOF and finish teardown.
     let mut output = Vec::new();
     stdout.read_to_end(&mut output)?;
-    assert!(child.wait()?.success());
+    let status = child.wait()?;
+    assert!(
+        status.success(),
+        "wrapper exited with {status} after the child handled TERM"
+    );
     fs::remove_dir_all(root)?;
     Ok(())
 }
