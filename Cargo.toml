@@ -34,7 +34,7 @@ clap = { version = "4.5", features = ["derive"], optional = true }
 # Unix terminal and process primitives used only by platform adapters.
 libc = { version = "0.2", optional = true }
 # Safe termios operations for raw-mode guards.
-nix = { version = "0.28", features = ["fs", "poll", "term"], optional = true }
+nix = { version = "0.28", features = ["fs", "poll", "term", "socket", "user"], optional = true }
 # Cross-platform pseudoterminal spawning and resizing.
 portable-pty = { version = "=0.9.0", optional = true }
 # Compiled screen-rule matchers.

@@ -47,3 +47,14 @@ agent-specific interpretation rules. Consumers must not authorize access based o
 Without zor, panes continue normally. Invalid or unsupported reports are ignored by the consumer.
 Observer/rule/sink failures must preserve byte forwarding, terminal queries, resize, signals,
 exit status, and child cleanup. The wrapper's passthrough integration suite covers these contracts.
+
+
+## Local multiplexer observer
+
+`zor observe --socket PATH --pane ID --pid PID` observes a pane already owned by fux. Optional global `--rules DIR` and `--agent ID` arguments may precede `observe`. The observer does not spawn or signal the pane command and does not own its PTY.
+
+The adapter reads bounded newline-delimited JSON `list` and `capture` responses through the local control socket and verifies the kernel peer UID. Replies have a 1 MiB cap and a two-second absolute read deadline. Captures request at most 128 KiB and are sampled every 100 ms. Pane identity is checked against both its ID and original PID on every sample; removal or replacement ends observation. Title, progress, and pane geometry are read as bounded data from the pane summary.
+
+Detection and the existing state machine remain in zor. Reports use the OSC v1 schema above, one report per newline on stdout. A consumer must apply a report-size limit before parsing, reject malformed output, and keep observer backpressure independent of pane input/output. Closing or killing the observer must not terminate the observed command.
+
+The fux control adapter negotiates control v1 by sending and verifying the eight-byte `FUXCTL1\n` preface before each RPC. A mismatch or stalled preface ends that sampling attempt without sending a command. Preface reads use an absolute two-second deadline. This is an independent wire consumer, not a fux library dependency.

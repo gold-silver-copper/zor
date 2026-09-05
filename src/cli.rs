@@ -17,6 +17,15 @@ pub enum Action {
         agent: Option<String>,
     },
     Agents,
+    /// Observe an existing local fux pane without owning its command.
+    Observe {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        pane: u32,
+        #[arg(long)]
+        pid: u32,
+    },
 }
 
 #[derive(Debug, Parser)]

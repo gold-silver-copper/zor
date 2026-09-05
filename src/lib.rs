@@ -15,3 +15,6 @@ pub mod rules;
 pub mod screen;
 #[cfg(feature = "cli")]
 pub mod state;
+
+#[cfg(feature = "cli")]
+pub mod observe;

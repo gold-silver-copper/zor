@@ -349,6 +349,16 @@ impl Screen {
     pub const fn ground(&self) -> bool {
         self.boundary.ground()
     }
+    /// Title supplied by a bounded local capture, kept as data rather than terminal escapes.
+    pub fn set_observed_title(&mut self, title: &str) {
+        self.parser.callbacks_mut().title = title.chars().take(256).collect();
+    }
+
+    /// Progress metadata supplied by the local pane emulator.
+    pub fn set_observed_progress(&mut self, progress: Option<crate::rules::view::Progress>) {
+        self.parser.callbacks_mut().progress = progress;
+    }
+
     pub fn clear_changed(&mut self) {
         self.changed = false;
     }

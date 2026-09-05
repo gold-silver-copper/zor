@@ -17,6 +17,9 @@ fn run(cli: cli::Cli) -> anyhow::Result<u8> {
     let sets = zor::rules::bundle::load_all(&cli.rules)?;
     if let Some(action) = cli.action {
         return match action {
+            cli::Action::Observe { socket, pane, pid } => {
+                zor::observe::run(&socket, pane, pid, cli.agent.as_deref(), &sets)
+            }
             cli::Action::Agents => {
                 println!("no bundled agent rule sets");
                 Ok(0)
